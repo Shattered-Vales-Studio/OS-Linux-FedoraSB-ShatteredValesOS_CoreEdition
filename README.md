@@ -60,9 +60,10 @@ misbehaves.
   Files sidebar), or as the new home of **apps**, everyone's **home
   folders** or **containers**. It shows the drive's model, size and type,
   explains each choice and asks you to type the drive's name before
-  erasing anything. Apps, home folders and containers move at the next
-  restart, before anyone signs in; the old copy is kept until you run
-  `sv-storage cleanup`. Setting up drives is for administrators only:
+  erasing anything. It checks first that the folder fits on the drive.
+  Apps, home folders and containers move at the next restart, before
+  anyone signs in; the old copy is kept until you run `sv-storage
+  cleanup`. Setting up drives is for administrators only:
   anyone else is told to ask an administrator, and the launcher only
   appears for administrators.
 - **Format USB Drive**, for everyone and without a password, erases a USB stick or memory card for Windows, Mac,

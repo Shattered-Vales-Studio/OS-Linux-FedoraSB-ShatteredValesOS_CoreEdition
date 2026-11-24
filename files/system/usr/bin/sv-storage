@@ -203,7 +203,11 @@ choose() {
                 printf '  %d) %s\n' "${i}" "${entry#*|}" >&2
             fi
         done
-        reply="$(ask "Choose 1-${i} [default: the recommended one]: " "")"
+        if [[ -n "${default}" ]]; then
+            reply="$(ask "Choose 1-${i} (Enter for the recommended one): " "")"
+        else
+            reply="$(ask "Choose 1-${i}: " "")"
+        fi
         if [[ -z "${reply}" && -n "${default}" ]]; then
             printf '%s\n' "${default}"
             return 0
@@ -517,6 +521,78 @@ mount_role() {
         /var/lib/docker)     echo docker ;;
         /var/mnt/*|/mnt/*)   echo storage ;;
     esac
+}
+
+# mount_disk
+#   Finds the whole drive a mount point's filesystem lives on, from the
+#   drive list (so it works the same with a test fixture).
+#   Arguments: $1 mount point
+#   Output: the drive path on stdout, or nothing when it is not a mount point
+#   Returns: 0 always
+mount_disk() {
+    jq -r --arg m "$1" 'first(.[] | select(any(.mounts[]; . == $m)) | .path) // empty' <<<"${DRIVES}"
+}
+
+# target_on_own_drive
+#   Tells whether a folder already lives on a drive of its own. A mount
+#   point alone does not mean that: on Fedora Atomic /var/home is a btrfs
+#   subvolume of the system drive, mounted separately, yet still on the
+#   system drive and free to move.
+#   Arguments: $1 folder
+#   Returns: 0 when the folder is mounted from a non-system drive, 1 otherwise
+target_on_own_drive() {
+    local disk
+    disk="$(mount_disk "$1")"
+    [[ -n "${disk}" ]] && ! is_system_drive "${disk}"
+}
+
+# role_bytes
+#   Measures how much space a folder takes, counting hard-linked files once
+#   (as the copy does) and staying on the folder's own filesystem. With a
+#   test fixture the real computer is never measured: the size is
+#   SV_STORAGE_SOURCE_BYTES, or 0.
+#   Arguments: $1 folder
+#   Output: the size in bytes on stdout
+#   Returns: 0 when measured completely, 1 when some files could not be
+#            read (the number is then too low)
+role_bytes() {
+    local out status=0
+    if fixture_mode; then
+        echo "${SV_STORAGE_SOURCE_BYTES:-0}"
+        return 0
+    fi
+    [[ -d "$1" ]] || { echo 0; return 0; }
+    out="$(du -sx --block-size=1 "$1" 2>/dev/null)" || status=1
+    echo "${out%%[[:space:]]*}"
+    return "${status}"
+}
+
+# needed_bytes
+#   Adds a 10% margin to a size, for filesystem metadata and anything that
+#   changes before the move runs.
+#   Arguments: $1 bytes
+#   Output: bytes on stdout
+#   Returns: 0 always
+needed_bytes() {
+    echo $(( $1 + $1 / 10 ))
+}
+
+# space_refusal
+#   Checks that a folder fits on a drive once formatted. A new filesystem
+#   gives about 93% of the drive to files (ext4 keeps 5% for the system,
+#   plus its own bookkeeping), which is the figure used here.
+#   Arguments: $1 role, $2 drive path, $3 bytes the folder takes
+#   Output: the plain refusal on stdout when it does not fit
+#   Returns: 0 when it does not fit, 1 when it fits
+space_refusal() {
+    local role="$1" dev="$2" used="$3" size usable need words
+    size="$(drive_get "${dev}" .size)"
+    usable=$(( size * 93 / 100 ))
+    need="$(needed_bytes "${used}")"
+    (( need > usable )) || return 1
+    words="$(role_words "${role}")"
+    echo "${words^} need about $(human_size "${need}"), but this drive holds about $(human_size "${usable}"). Choose a bigger drive."
+    return 0
 }
 
 # classify
@@ -1006,7 +1082,10 @@ pick_drive() {
     for dev in "$@"; do
         entries+=("${dev}|${dev#/dev/}: $(drive_title "${dev}"), $(classify "${dev}" | cut -d'|' -f2)")
     done
-    choose "${question}" "" "${entries[@]}"
+    # With one drive to choose from, Enter picks it.
+    local default=""
+    (( $# == 1 )) && default="$1"
+    choose "${question}" "${default}" "${entries[@]}"
 }
 
 # offered_roles
@@ -1024,7 +1103,7 @@ offered_roles() {
         target="$(role_target "${role}")"
         [[ "${role}" == docker && ! -d "${target}" ]] && continue
         # Already on its own drive, or a move is already waiting.
-        findmnt -n --mountpoint "${target}" >/dev/null 2>&1 && continue
+        target_on_own_drive "${target}" && continue
         [[ -r "${MOVES_FILE}" ]] && grep -q "^${role} " "${MOVES_FILE}" && continue
         case "${role}" in
             apps)       echo "apps|Apps: move all installed apps (Flatpak) onto this drive" ;;
@@ -1215,6 +1294,13 @@ apply_setup() {
     if [[ "${role}" != storage ]] && is_portable "${dev}"; then
         die "a USB or removable drive can only be used for storage"
     fi
+    if [[ "${role}" != storage ]]; then
+        local used refusal
+        used="$(role_bytes "$(role_target "${role}")")" || true
+        if refusal="$(space_refusal "${role}" "${dev}" "${used}")"; then
+            die "${refusal} Nothing was changed." 1
+        fi
+    fi
     log_event "setup ${dev} role=${role} name=${name} fs=${fs} mode=${mode} by=${asker:-root}"
 
     if [[ "${mode}" == keep ]]; then
@@ -1349,6 +1435,16 @@ cmd_setup() {
         role="$(choose "What should ${dev#/dev/} be used for?" storage "${roles[@]}")"
     fi
     grep "^${role}|" <<<"$(offered_roles "${dev}")" >/dev/null || die "${role} is not possible for ${dev#/dev/}" 64
+    if [[ "${role}" != storage ]]; then
+        local used refusal
+        echo "Measuring $(role_target "${role}")..."
+        # Without administrator rights some folders (other people's homes)
+        # cannot be read, so the size is only trusted when fully measured;
+        # the administrator step measures again before anything is erased.
+        if used="$(role_bytes "$(role_target "${role}")")" && refusal="$(space_refusal "${role}" "${dev}" "${used}")"; then
+            die "${refusal}" 1
+        fi
+    fi
 
     keep="$(keepable_filesystem "${dev}")"
     if [[ -z "${mode}" ]]; then
@@ -1449,14 +1545,65 @@ plymouth_say() {
     plymouth display-message --text="$*" 2>/dev/null || true
 }
 
+# release_mount
+#   Unmounts a folder reliably after a copy. A copy that just failed can
+#   still be closing files on it, which makes a plain umount report "target
+#   is busy" and would leave the new drive mounted, so it retries for a few
+#   seconds and only then detaches it lazily (logged).
+#   Arguments: $1 mount point
+#   Returns: 0 always
+release_mount() {
+    local mp="$1" i
+    cd /
+    sync
+    findmnt -n --mountpoint "${mp}" >/dev/null 2>&1 || return 0
+    for (( i = 0; i < 10; i++ )); do
+        umount "${mp}" 2>/dev/null && return 0
+        sleep 1
+    done
+    log_event "could not unmount ${mp} cleanly; detaching it lazily"
+    umount -l "${mp}" 2>/dev/null || log_event "could not detach ${mp}"
+    return 0
+}
+
+# fstab_line_for
+#   Finds the fstab line that mounts a folder, also under its other name
+#   (/home is a link to /var/home on Fedora Atomic, and the installer
+#   writes the home subvolume as /home).
+#   Arguments: $1 folder
+#   Output: the line number on stdout, or nothing
+#   Returns: 0 always
+fstab_line_for() {
+    local alt=""
+    [[ "$1" == /var/home ]] && alt=/home
+    awk -v t="$1" -v a="${alt}" '!/^[[:space:]]*#/ && NF >= 2 && ($2 == t || (a != "" && $2 == a)) {print NR; exit}' "${FSTAB}"
+}
+
+# restore_fstab
+#   Puts back an fstab backup and lets systemd reread it.
+#   Arguments: $1 backup file
+#   Returns: 0 always
+restore_fstab() {
+    cp -a "$1" "${FSTAB}"
+    systemctl daemon-reload
+}
+
 # process_move
 #   Moves one folder onto its new drive. The copy is checked against the
 #   original before anything is switched over; on any problem the original
 #   stays exactly where it was and in use.
+#
+#   A plain folder (apps, containers) is renamed into the old-copies folder
+#   and the new drive mounted in its place. A folder that is itself a mount
+#   on the system drive (the home folders' btrfs subvolume on Fedora
+#   Atomic) cannot be renamed: its fstab line is switched off with a marker
+#   comment instead, and the subvolume keeps the old copy untouched until
+#   `sv-storage cleanup`.
 #   Arguments: $1 role, $2 filesystem UUID, $3 target folder
 #   Returns: 0 on success, 1 when the move was refused or failed
 process_move() {
     local role="$1" uuid="$2" target="$3" dev tmp src_sum dst_sum stamp old backup fs
+    local subvol_line="" line_no="" used avail need
     log_event "move start: ${role} ${uuid} -> ${target}"
     dev="/dev/disk/by-uuid/${uuid}"
     local i
@@ -1467,36 +1614,56 @@ process_move() {
         sleep 1
     done
     [[ -e "${dev}" ]] || { log_event "move refused: drive ${uuid} not found"; return 1; }
-    if findmnt -n --mountpoint "${target}" >/dev/null 2>&1; then
-        log_event "move refused: ${target} is already a separate mount"
+    if target_on_own_drive "${target}"; then
+        log_event "move refused: ${target} is already on a drive of its own"
         return 1
+    fi
+    if findmnt -n --mountpoint "${target}" >/dev/null 2>&1; then
+        line_no="$(fstab_line_for "${target}")"
+        if [[ -z "${line_no}" ]]; then
+            log_event "move refused: ${target} is mounted, but not from ${FSTAB}, so it cannot be switched over"
+            return 1
+        fi
+        subvol_line="$(sed -n "${line_no}p" "${FSTAB}")"
     fi
     fs="$(blkid -s TYPE -o value "${dev}")"
     tmp="/run/sv-storage-move/${role}"
     mkdir -p "${tmp}"
     mount "${dev}" "${tmp}" || { log_event "move refused: could not mount ${uuid}"; return 1; }
     if [[ -n "$(find "${tmp}" -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit)" ]]; then
-        umount "${tmp}"
+        release_mount "${tmp}"
         log_event "move refused: the new drive ${uuid} is not empty"
         return 1
     fi
     if [[ -d "${target}" ]]; then
+        used="$(role_bytes "${target}")" || true
+        need="$(needed_bytes "${used:-0}")"
+        avail="$(df --output=avail -B1 "${tmp}" | tail -n1 | tr -d ' ')"
+        if (( need > avail )); then
+            release_mount "${tmp}"
+            log_event "move refused: ${target} needs about $(human_size "${need}") but the new drive has $(human_size "${avail}") free; nothing was copied"
+            return 1
+        fi
         plymouth_say "Moving $(role_words "${role}") to the new drive. This can take a while; please wait."
-        if ! rsync -aHAX --numeric-ids "${target}/" "${tmp}/" >> "${LOG_FILE}" 2>&1; then
-            umount "${tmp}"
+        # SELinux labels are not copied: restorecon sets them from policy
+        # once the drive is in place. Copying them fails on files that have
+        # none (a system installed with SELinux off), because the new
+        # filesystem labels every file and the label cannot be removed.
+        if ! rsync -aHAX --numeric-ids --filter='-x security.selinux' "${target}/" "${tmp}/" >> "${LOG_FILE}" 2>&1; then
+            release_mount "${tmp}"
             log_event "move refused: copying ${target} failed; the original is unchanged"
             return 1
         fi
         src_sum="$(tree_summary "${target}")"
         dst_sum="$(tree_summary "${tmp}")"
         if [[ "${src_sum}" != "${dst_sum}" ]]; then
-            umount "${tmp}"
+            release_mount "${tmp}"
             log_event "move refused: copy check failed (original ${src_sum}, copy ${dst_sum}); the original is unchanged"
             return 1
         fi
         log_event "move copied and checked: ${src_sum} (entries bytes)"
     fi
-    umount "${tmp}"
+    release_mount "${tmp}"
     rmdir "${tmp}" 2>/dev/null || true
 
     stamp="$(date +%Y%m%d-%H%M%S)"
@@ -1505,7 +1672,17 @@ process_move() {
     chmod 700 "${OLD_DIR}"
     backup="${FSTAB}.sv-storage-${stamp}-move"
     cp -a "${FSTAB}" "${backup}"
-    if [[ -d "${target}" ]]; then
+    if [[ -n "${subvol_line}" ]]; then
+        sed -i "${line_no}s|^|${FSTAB_MARK} moved to ${uuid} on ${stamp}: |" "${FSTAB}"
+        systemctl daemon-reload
+        release_mount "${target}"
+        if findmnt -n --mountpoint "${target}" >/dev/null 2>&1; then
+            log_event "move failed: ${target} could not be unmounted; putting fstab back"
+            restore_fstab "${backup}"
+            return 1
+        fi
+        printf '%s\n' "${subvol_line}" > "${old}.subvolume"
+    elif [[ -d "${target}" ]]; then
         mv "${target}" "${old}"
         mkdir "${target}"
         chmod --reference="${old}" "${target}"
@@ -1516,16 +1693,22 @@ process_move() {
     if ! fstab_add "${uuid}" "${target}" "${fs}" "$(mount_options "${fs}" "${role}" "" 0 0)" "${role}" "$(role_words "${role}")" \
         || ! mount "${target}"; then
         log_event "move failed: could not mount ${target}; putting the original back"
-        umount "${target}" 2>/dev/null || true
-        if [[ -d "${old}" ]]; then
+        release_mount "${target}"
+        restore_fstab "${backup}"
+        if [[ -n "${subvol_line}" ]]; then
+            rm -f "${old}.subvolume"
+            mount "${target}" || log_event "could not remount the original ${target}; restart to get it back"
+        elif [[ -d "${old}" ]]; then
             rmdir "${target}" && mv "${old}" "${target}"
         fi
-        cp -a "${backup}" "${FSTAB}"
-        systemctl daemon-reload
         return 1
     fi
     restorecon -R "${target}" || log_event "restorecon reported problems on ${target}"
-    log_event "move done: ${target} is on ${uuid}; old copy in ${old}"
+    if [[ -n "${subvol_line}" ]]; then
+        log_event "move done: ${target} is on ${uuid}; the old copy stays in the subvolume of: ${subvol_line}"
+    else
+        log_event "move done: ${target} is on ${uuid}; old copy in ${old}"
+    fi
 }
 
 # cmd_run_moves
@@ -1538,12 +1721,21 @@ cmd_run_moves() {
     local role uuid target failed=0
     (( EUID == 0 )) || die "run-moves runs at start-up as root"
     [[ -s "${MOVES_FILE}" ]] || return 0
+    load_drives
     while read -r role uuid target; do
         [[ -n "${role}" ]] || continue
-        if ! process_move "${role}" "${uuid}" "${target}"; then
+        if process_move "${role}" "${uuid}" "${target}"; then
+            # An earlier failure for this role is now resolved.
+            if [[ -f "${MOVES_FAILED}" ]]; then
+                sed -i "/^${role} /d" "${MOVES_FAILED}"
+                [[ -s "${MOVES_FAILED}" ]] || rm -f "${MOVES_FAILED}"
+            fi
+        else
             printf '%s %s %s %s\n' "${role}" "${uuid}" "${target}" "$(date -Is)" >> "${MOVES_FAILED}"
             failed=1
         fi
+        # Later moves see the drives as they are now.
+        load_drives
     done < "${MOVES_FILE}"
     # Failed moves are not retried at every start; they are recorded in
     # the .failed file, shown by `sv-storage list` and sv-doctor, and the
@@ -1554,6 +1746,70 @@ cmd_run_moves() {
 }
 
 # ---------------------------------------------------------------- cleanup
+
+# mount_old_subvolume
+#   Mounts the old copy left in a subvolume after a move (recorded as its
+#   former fstab line in a .subvolume file), writable, at a private
+#   temporary folder.
+#   Arguments: $1 .subvolume record, $2 empty folder to mount it on
+#   Returns: mount's exit status
+mount_old_subvolume() {
+    local src fstype opts
+    read -r src _ fstype opts _ < "$1"
+    # The system's own fstab lines can carry ro; the old copy is opened to
+    # be emptied.
+    opts="$(tr ',' '\n' <<<"${opts}" | grep -vx ro | paste -sd, -)"
+    mount -t "${fstype}" -o "${opts:-defaults}" "${src}" "$2"
+}
+
+# old_copy_size
+#   Measures an old copy: a folder, or a subvolume recorded in a
+#   .subvolume file.
+#   Arguments: $1 entry in the old-copies folder
+#   Output: a human size on stdout ("?" when it cannot be measured)
+#   Returns: 0 always
+old_copy_size() {
+    local tmp size="?"
+    if [[ "$1" == *.subvolume ]]; then
+        tmp="$(mktemp -d)"
+        if mount_old_subvolume "$1" "${tmp}" 2>/dev/null; then
+            size="$(du -sxh "${tmp}" 2>/dev/null | cut -f1)"
+            release_mount "${tmp}"
+        fi
+        rmdir "${tmp}" 2>/dev/null || true
+    else
+        size="$(du -sh "$1" 2>/dev/null | cut -f1)"
+    fi
+    echo "${size:-?}"
+}
+
+# delete_old_copy
+#   Deletes one old copy. A subvolume is emptied rather than removed, so
+#   the system drive's layout stays as the installer made it.
+#   Arguments: $1 entry in the old-copies folder
+#   Returns: 0 on success, 1 when a subvolume could not be opened
+delete_old_copy() {
+    local tmp
+    if [[ "$1" != *.subvolume ]]; then
+        run rm -rf --one-file-system "$1"
+        return 0
+    fi
+    if (( DRY_RUN )); then
+        echo "  would mount the subvolume recorded in $1, delete its contents and remove the record"
+        return 0
+    fi
+    tmp="$(mktemp -d)"
+    if ! mount_old_subvolume "$1" "${tmp}"; then
+        rmdir "${tmp}"
+        warn "Could not open the old copy recorded in $(basename "$1"); it was kept."
+        return 1
+    fi
+    find "${tmp}" -xdev -mindepth 1 -delete
+    release_mount "${tmp}"
+    rmdir "${tmp}"
+    rm -f "$1"
+    log_event "cleanup: emptied the old subvolume recorded in $1"
+}
 
 # cmd_cleanup
 #   Deletes the old copies of moved folders after confirmation.
@@ -1572,7 +1828,7 @@ cmd_cleanup() {
     fi
     say "Old copies kept on the system drive"
     for entry in "${OLD_DIR}"/*; do
-        printf '  %-40s %s\n' "$(basename "${entry}")" "$(du -sh "${entry}" 2>/dev/null | cut -f1)"
+        printf '  %-40s %s\n' "$(basename "${entry%.subvolume}")" "$(old_copy_size "${entry}")"
     done
     echo
     echo "These are the folders as they were before they moved to their new drive."
@@ -1581,10 +1837,16 @@ cmd_cleanup() {
         reply="$(ask "Type delete to remove them, anything else to keep them: " "")"
         [[ "${reply,,}" == delete ]] || { echo "Kept. Nothing was changed."; exit 3; }
     fi
+    local failed=0
     for entry in "${OLD_DIR}"/*; do
-        run rm -rf --one-file-system "${entry}"
+        delete_old_copy "${entry}" || failed=1
     done
-    (( DRY_RUN )) || echo "Done. The space is free again."
+    (( DRY_RUN )) && return 0
+    if (( failed )); then
+        echo "Some old copies could not be removed; see above."
+        return 1
+    fi
+    echo "Done. The space is free again."
 }
 
 # ---------------------------------------------------------------- remove

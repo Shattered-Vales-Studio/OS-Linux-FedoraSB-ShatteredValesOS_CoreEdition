@@ -10,7 +10,10 @@
 #   mode sv-storage refuses every change except --dry-run.
 #
 # Inputs:
-#   tests/fixtures/sv-storage-lsblk.json
+#   tests/fixtures/sv-storage-lsblk.json (a Fedora Atomic layout: /var/home
+#   is a btrfs subvolume on the system NVMe)
+#   tests/fixtures/sv-storage-lsblk-home-moved.json (the same computer with
+#   the home folders already on a drive of their own)
 #
 # Usage:
 #   tests/sv-storage.sh      (Linux; needs bash, jq and util-linux)
@@ -66,16 +69,18 @@ lacks() {
 }
 
 # tool
-#   Runs sv-storage against the fixture, as an administrator unless ADMIN
-#   is set to 0.
+#   Runs sv-storage against the fixture (FIXTURE picks another one), as an
+#   administrator unless ADMIN is set to 0. SOURCE_BYTES stands in for the
+#   size of the folder a move would copy.
 #   Arguments: sv-storage arguments
 #   Output: its combined output; the exit status is appended as "rc=N"
 #   Returns: 0 always
 tool() {
     local rc=0 out
-    out="$(SV_STORAGE_LSBLK_JSON="${ROOT}/tests/fixtures/sv-storage-lsblk.json" \
+    out="$(SV_STORAGE_LSBLK_JSON="${FIXTURE:-${ROOT}/tests/fixtures/sv-storage-lsblk.json}" \
         SV_STORAGE_SYSTEM_DISKS="${SYSTEM_DISKS-}" SV_STORAGE_SYSFS="${WORK}/sys" \
         SV_STORAGE_FSTAB="${WORK}/fstab" SV_STORAGE_ADMIN="${ADMIN:-1}" \
+        SV_STORAGE_SOURCE_BYTES="${SOURCE_BYTES:-}" \
         bash "${TOOL}" "$@" </dev/null 2>&1)" || rc=$?
     printf '%s\nrc=%d\n' "${out}" "${rc}"
 }
@@ -184,6 +189,22 @@ out="$(tool setup nvme1n1 --role apps --name Apps --fs ext4 --erase --yes --dry-
 expect "setup dry run: NVMe partition is p1" "$(contains "${out}" "/dev/nvme1n1p1")" "${out}"
 expect "setup dry run: apps move is queued for boot" "$(contains "${out}" "apps <new-uuid> /var/lib/flatpak")" "${out}"
 expect "setup dry run: move does not touch fstab now" "$(lacks "${out}" "fstab (after")" "${out}"
+out="$(tool setup nvme1n1 --role homes --name Homes --fs ext4 --erase --yes --dry-run)"
+expect "homes: offered while /var/home is a subvolume on the system drive" "$(contains "${out}" "homes <new-uuid> /var/home")" "${out}"
+out="$(FIXTURE="${ROOT}/tests/fixtures/sv-storage-lsblk-home-moved.json" tool setup nvme1n1 --role homes --name Homes --fs ext4 --erase --yes --dry-run)"
+expect "homes: not offered once /var/home is on a drive of its own" "$(contains "${out}" "not possible")" "${out}"
+out="$(FIXTURE="${ROOT}/tests/fixtures/sv-storage-lsblk-home-moved.json" tool list)"
+expect "homes: the drive holding /var/home shows its role" "$(contains "$(grep -A1 '^  sdb ' <<<"${out}")" "/var/home")" "${out}"
+out="$(SOURCE_BYTES=2000000000000 tool setup nvme1n1 --role apps --name Apps --fs ext4 --erase --yes --dry-run)"
+expect "space: a move that does not fit is refused" "$(contains "${out}" "need about 2.2 TB, but this drive holds about 930 GB")" "${out}"
+expect "space: refused before the drive is touched" "$(lacks "${out}" "would run")" "${out}"
+expect "space: refusal exits 1" "$(contains "${out}" "rc=1")" "${out}"
+out="$(SOURCE_BYTES=850000000000 tool setup nvme1n1 --role apps --name Apps --fs ext4 --erase --yes --dry-run)"
+expect "space: just over the 10% margin is refused" "$(contains "${out}" "Choose a bigger drive")" "${out}"
+out="$(SOURCE_BYTES=100000000000 tool setup nvme1n1 --role apps --name Apps --fs ext4 --erase --yes --dry-run)"
+expect "space: a move that fits is queued" "$(contains "${out}" "apps <new-uuid> /var/lib/flatpak")" "${out}"
+out="$(SOURCE_BYTES=2000000000000 tool setup sda --role storage --name Archive --fs ext4 --erase --yes --dry-run)"
+expect "space: storage drives are not size-checked" "$(contains "${out}" "rc=0")" "${out}"
 out="$(tool setup sdb --role storage --name Photos --keep --yes --dry-run)"
 expect "setup dry run: keep mode does not wipe" "$(lacks "${out}" "wipefs")" "${out}"
 expect "setup dry run: keep mode mounts the existing filesystem" "$(contains "${out}" "UUID=u-sdb1  /var/mnt/Photos")" "${out}"
@@ -255,6 +276,14 @@ expect "fstab: NTFS uses the kernel driver and owner options" \
 expect "fstab: moved folders are ordered before local-fs.target" \
     "$(contains "$(mount_options ext4 homes "" 0 0)" "x-systemd.before=local-fs.target")"
 expect "fstab: escaping round-trips" "$( [[ "$(fstab_unescape "$(fstab_escape "My Media")")" == "My Media" ]] && echo ok)"
+expect "space: the real computer is never measured with a fixture" \
+    "$( [[ "$(SV_STORAGE_LSBLK_JSON=x role_bytes /)" == 0 ]] && echo ok)"
+printf '%s\n' "UUID=u-root / btrfs subvol=root,ro 0 0" "UUID=u-root /home btrfs subvol=home,compress=zstd:1 0 0" \
+    "UUID=u-root /var btrfs subvol=var 0 0" > "${WORK}/fstab-atomic"
+expect "subvolume: finds the installer's /home line for /var/home" \
+    "$( [[ "$(SV_STORAGE_FSTAB="${WORK}/fstab-atomic" bash -c 'source "$1"; fstab_line_for /var/home' _ "${TOOL}")" == 2 ]] && echo ok)"
+expect "subvolume: no line for a folder fstab does not mount" \
+    "$( [[ -z "$(SV_STORAGE_FSTAB="${WORK}/fstab-atomic" bash -c 'source "$1"; fstab_line_for /var/lib/flatpak' _ "${TOOL}")" ]] && echo ok)"
 expect "size: decimal units" "$( [[ "$(human_size 500107862016)" == "500 GB" && "$(human_size 31004295168)" == "31 GB" ]] && echo ok)"
 
 echo
