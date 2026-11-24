@@ -15,6 +15,9 @@
 #   - a drive with anything mounted is never offered for set-up; USB sticks
 #     are unmounted through udisks first and the format stops if that fails;
 #   - loop, zram and CD/DVD devices are ignored;
+#   - setup, remove and cleanup are refused to non-administrators before
+#     any password prompt; USB formatting goes through udisks, which only
+#     lets non-administrators change removable and USB drives;
 #   - every destructive step shows the drive's model, size, type and what
 #     will be erased, and needs the drive's short name or "erase" typed
 #     (--yes skips this, for scripted use only);
@@ -26,13 +29,15 @@
 #
 # Usage:
 #   sv-storage [list]                 Every drive and what it is used for.
-#   sv-storage setup [DEVICE]         Set up an unused drive.
+#   sv-storage setup [DEVICE]         Set up an unused drive (administrators).
 #       --role storage|apps|homes|containers|docker
 #       --name NAME  --fs ext4|xfs|btrfs|exfat|ntfs  --erase|--keep
-#   sv-storage usb [DEVICE]           Format a USB stick or card.
+#   sv-storage usb [DEVICE]           Format a USB stick or card (anyone).
 #       --fs exfat|fat32|ntfs|ext4  --name NAME  --no-mount
-#   sv-storage remove [NAME|DEVICE]   Stop using a storage drive (keeps data).
-#   sv-storage cleanup                Delete old copies left by moves.
+#   sv-storage remove [NAME|DEVICE]   Stop using a storage drive (keeps data;
+#                                     administrators).
+#   sv-storage cleanup                Delete old copies left by moves
+#                                     (administrators).
 #   sv-storage check                  Quietly list new internal drives.
 #   sv-storage run-moves              Start-up only (run by
 #                                     shatteredvales-storage-move.service).
@@ -40,18 +45,23 @@
 #       --dry-run   Show exactly what would run; change nothing.
 #       --yes       Skip questions and confirmation (scripted use only).
 #       --wait      Keep the window open at the end (used by launchers).
-#   Changes ask for an administrator password (pkexec, or sudo without a
-#   desktop).
+#   setup, remove and cleanup are for administrators (wheel) and ask for
+#   their password (pkexec, or sudo without a desktop); anyone else is told
+#   to ask an administrator. usb runs as the person through udisks, which
+#   lets anyone signed in at the computer format USB and removable drives
+#   without a password and never the computer's own drives.
 #
 # Environment (tests only; any change command refuses to run with these):
 #   SV_STORAGE_LSBLK_JSON    file holding `lsblk -J` output to use instead
 #   SV_STORAGE_SYSTEM_DISKS  space-separated system disk paths for fixtures
 #   SV_STORAGE_SYSFS         folder standing in for /sys
 #   SV_STORAGE_FSTAB         fstab to read instead of /etc/fstab
+#   SV_STORAGE_ADMIN         1 or 0: treat the caller as an administrator
 #
 # Exit codes:
 #   0 on success, 1 on failure, 3 when cancelled, 10 when `check` finds
-#   unassigned internal drives, 64 on bad usage.
+#   unassigned internal drives, 64 on bad usage, 77 when a non-administrator
+#   asks for setup, remove or cleanup.
 
 set -euo pipefail
 
@@ -832,6 +842,25 @@ fstab_remove_uuid() {
 require_changes_allowed() {
     fixture_mode && (( ! DRY_RUN )) && die "test fixture in use; only --dry-run is allowed"
     return 0
+}
+
+# admin_allowed
+#   Lets only administrators (members of wheel, or root) set up, remove or
+#   clean up drives, and says so plainly before any password prompt: a
+#   password dialog that nobody in the house can answer is worse than a
+#   clear "ask someone". Tests may set SV_STORAGE_ADMIN to 1 or 0, honoured
+#   only with a fixture, where every real change is refused anyway.
+#   Arguments: none
+#   Output: the refusal on stderr
+#   Returns: 0 for administrators, 1 otherwise
+admin_allowed() {
+    if fixture_mode && [[ -n "${SV_STORAGE_ADMIN:-}" ]]; then
+        [[ "${SV_STORAGE_ADMIN}" == 1 ]] && return 0
+    elif (( EUID == 0 )) || id -nG | tr ' ' '\n' | grep -qx wheel; then
+        return 0
+    fi
+    echo "Setting up drives needs an administrator account. Ask someone who looks after this computer." >&2
+    return 1
 }
 
 # run_as_admin
@@ -1689,96 +1718,144 @@ usb_refusal() {
     return 0
 }
 
+# udisks_path
+#   Gives the udisks object path of a block device. udisks names objects
+#   after the kernel device name, escaping anything but letters, digits and
+#   underscores as _xx hex; kernel disk names need no escaping.
+#   Arguments: $1 device path (/dev/sdc)
+#   Output: the object path on stdout
+#   Returns: 0 always
+udisks_path() {
+    echo "/org/freedesktop/UDisks2/block_devices/${1#/dev/}"
+}
+
+# udisks_call
+#   Calls one udisks method as the person running sv-storage. udisks asks
+#   polkit, which lets anyone signed in at the computer change and mount USB
+#   and removable drives without a password, and never lets them change the
+#   computer's own drives. Long timeout: formatting a large or slow stick
+#   can take minutes.
+#   Arguments: $1 device path, $2 interface (Block, PartitionTable,
+#              Filesystem), $3 method, $4 busctl signature, then its values
+#   Output: the method's reply on stdout
+#   Returns: busctl's exit status
+udisks_call() {
+    local dev="$1" iface="$2" method="$3"
+    shift 3
+    busctl --system --timeout=900 call org.freedesktop.UDisks2 "$(udisks_path "${dev}")" \
+        "org.freedesktop.UDisks2.${iface}" "${method}" "$@"
+}
+
+# udisks_ready
+#   Confirms udisks is running and agrees the drive is not a system drive.
+#   udisks marks a drive as a system drive unless it is removable or on a
+#   USB, FireWire or SDIO bus, and polkit would then ask for an
+#   administrator password; refusing here keeps Format USB Drive to drives
+#   anyone may change.
+#   Arguments: $1 device path
+#   Returns: 0 when the drive may be formatted; exits 1 otherwise
+udisks_ready() {
+    local dev="$1" hint
+    hint="$(busctl --system get-property org.freedesktop.UDisks2 "$(udisks_path "${dev}")" \
+        org.freedesktop.UDisks2.Block HintSystem 2>/dev/null)" \
+        || die "the disk service (udisks) is not running or does not know ${dev}; unplug the stick, plug it back in and try again"
+    [[ "${hint}" == "b false" ]] \
+        || die "${dev#/dev/} is treated as a fixed drive by this computer, so it cannot be formatted here"
+}
+
+# udisks_format_type
+#   Maps a filesystem choice to the udisks format type and MBR partition
+#   type.
+#   Arguments: $1 filesystem (exfat, fat32, ntfs, ext4)
+#   Output: "<udisks type> <MBR type>" on stdout
+#   Returns: 0 always
+udisks_format_type() {
+    case "$1" in
+        exfat) echo "exfat 0x07" ;;
+        ntfs)  echo "ntfs 0x07" ;;
+        fat32) echo "vfat 0x0c" ;;
+        ext4)  echo "ext4 0x83" ;;
+    esac
+}
+
 # apply_usb
-#   Formats a USB drive that has been confirmed. Image writers such as
-#   balenaEtcher leave an ISO9660 filesystem at the start of the stick and
-#   a backup GPT at its end, which survive a plain new partition table and
-#   confuse every tool, so both ends are zeroed as well as wiped.
+#   Formats a confirmed USB drive through udisks, as the person running
+#   sv-storage, so no administrator password is needed. Image writers such
+#   as balenaEtcher leave an ISO9660 filesystem and a hybrid MBR at the
+#   start of the stick and a backup GPT at its end; the first format
+#   ("empty") has udisks wipe every signature it finds on the whole stick,
+#   both ends included, before the new MBR table is written. MBR rather
+#   than GPT: older TVs, cameras, car stereos and some Windows versions only
+#   read MBR sticks. ext4 sticks are given to the person (take-ownership),
+#   since ext4 keeps Linux owners.
 #   Arguments: $1 drive, $2 filesystem (exfat, fat32, ntfs, ext4),
-#              $3 label, $4 user who will own an ext4 drive
-#   Returns: 0 on success, 1 on failure
+#              $3 label, $4 1 to open it in Files afterwards
+#   Returns: 0 on success; exits 1 on failure
 apply_usb() {
-    local dev="$1" fs="$2" label="$3" owner="$4" part reason size sectors type tmp
-    if (( EUID != 0 && ! DRY_RUN )); then
-        die "this step must run as an administrator"
-    fi
+    local dev="$1" fs="$2" label="$3" mount="$4" part reason udtype mbrtype reply new
     if reason="$(usb_refusal "${dev}")"; then :; else
         die "${dev#/dev/} cannot be formatted: ${reason}"
     fi
-    log_event "usb format ${dev} fs=${fs} label=${label} owner=${owner:-root}"
+    read -r udtype mbrtype <<<"$(udisks_format_type "${fs}")"
+    local -a fsopts=(label s "${label}")
+    [[ "${fs}" == ext4 ]] && fsopts+=(take-ownership b true)
+
+    if (( DRY_RUN )); then
+        while read -r part; do
+            [[ -n "${part}" ]] && echo "  would ask udisks to unmount ${part}"
+        done < <(drive_get "${dev}" '.parts[] | select(.mounts | length > 0) | .path')
+        echo "  would ask udisks to wipe every signature on ${dev} (Block.Format empty)"
+        echo "  would ask udisks to write a new MBR table on ${dev} (Block.Format dos)"
+        echo "  would ask udisks to create one partition of type ${mbrtype} and format it as ${udtype} labelled ${label}$([[ "${fs}" == ext4 ]] && echo ", owned by you")"
+        (( mount )) && echo "  would ask udisks to mount it so it opens in Files"
+        return 0
+    fi
+
+    udisks_ready "${dev}"
+    log_event "usb format ${dev} fs=${fs} label=${label} by $(id -un)"
     say "Unmounting"
     while read -r part; do
         [[ -n "${part}" ]] || continue
-        run udisksctl unmount --no-user-interaction -b "${part}" \
+        udisksctl unmount -b "${part}" >/dev/null \
             || die "could not unmount ${part}; close any windows using the stick and try again"
-    done < <(drive_get "${dev}" '.parts[] | select(.mounts | length > 0) | .path')
-    # Image writers can leave a filesystem on the whole stick, mounted
-    # without any partition.
-    if [[ -n "$(drive_get "${dev}" '.mounts[]')" ]] && (( ! DRY_RUN )) \
-        && [[ -n "$(lsblk -ndo MOUNTPOINTS "${dev}" | tr -d '[:space:]')" ]]; then
-        run udisksctl unmount --no-user-interaction -b "${dev}" \
-            || die "could not unmount ${dev}; close any windows using the stick and try again"
-    fi
-    if (( ! DRY_RUN )) && [[ -n "$(lsblk -nro MOUNTPOINTS "${dev}" | tr -d '[:space:]')" ]]; then
+    done < <(lsblk -nlpo PATH,MOUNTPOINTS "${dev}" | awk 'NF > 1 {print $1}' | sort -u)
+    if [[ -n "$(lsblk -nro MOUNTPOINTS "${dev}" | tr -d '[:space:]')" ]]; then
         die "${dev} is still in use; nothing was erased"
     fi
 
     say "Erasing"
-    wipe_drive "${dev}"
-    size="$(drive_get "${dev}" .size)"
-    sectors=$(( size / 512 ))
-    run dd if=/dev/zero of="${dev}" bs=512 count=4096 conv=fsync status=none
-    if (( sectors > 8192 )); then
-        run dd if=/dev/zero of="${dev}" bs=512 seek=$(( sectors - 4096 )) count=4096 conv=fsync status=none
-    fi
-    run blockdev --rereadpt "${dev}" || true
-    run udevadm settle
+    # No tear-down option: it can edit fstab and crypttab, so udisks would
+    # need an administrator for it, and a stick has nothing set up there.
+    udisks_call "${dev}" Block Format 'sa{sv}' empty 0 >/dev/null \
+        || die "could not erase ${dev}; nothing more was changed"
+    udisks_call "${dev}" Block Format 'sa{sv}' dos 0 >/dev/null \
+        || die "could not write a new partition table on ${dev}"
 
-    case "${fs}" in
-        exfat|ntfs) type=7 ;;
-        fat32)      type=c ;;
-        ext4)       type=83 ;;
-    esac
-    if (( DRY_RUN )); then
-        printf '  would run: sfdisk %s, with the table "label: dos; type=%s"\n' "${dev}" "${type}"
-    else
-        log_event "run: sfdisk dos type=${type} ${dev}"
-        # MBR rather than GPT: older TVs, cameras, car stereos and some
-        # Windows versions only read MBR sticks.
-        printf 'label: dos\ntype=%s\n' "${type}" | sfdisk --quiet --wipe always --wipe-partitions always "${dev}"
-    fi
-    part="$(wait_for_partition "${dev}")" || die "the new partition on ${dev} did not appear"
     say "Formatting as ${fs}"
-    make_filesystem "${part}" "${fs}" "${label}"
-    if [[ "${fs}" == ext4 && -n "${owner}" ]]; then
-        # ext4 keeps Linux owners: without this only root could write to it.
-        if (( DRY_RUN )); then
-            echo "  would mount ${part} briefly and give its top folder to ${owner}"
-        else
-            tmp="$(mktemp -d /run/sv-storage-usb.XXXXXX)"
-            mount "${part}" "${tmp}"
-            chown "${owner}:$(id -gn "${owner}")" "${tmp}"
-            umount "${tmp}"
-            rmdir "${tmp}"
-        fi
+    reply="$(udisks_call "${dev}" PartitionTable CreatePartitionAndFormat 'ttssa{sv}sa{sv}' \
+        0 0 "${mbrtype}" "" 0 "${udtype}" "$(( ${#fsopts[@]} / 3 ))" "${fsopts[@]}")" \
+        || die "could not create the new partition on ${dev}"
+    new="$(sed -E 's/^o "(.*)"$/\1/' <<<"${reply}")"
+    part="/dev/${new##*/}"
+    log_event "usb format done: ${dev} ${fs} ${label} (${part})"
+    if (( mount )); then
+        busctl --system --timeout=60 call org.freedesktop.UDisks2 "${new}" \
+            org.freedesktop.UDisks2.Filesystem Mount 'a{sv}' 0 >/dev/null \
+            || echo "Unplug the stick and plug it back in to open it."
     fi
-    run udevadm settle
-    log_event "usb format done: ${dev} ${fs} ${label}"
-    (( DRY_RUN )) || echo "${part}" > "/run/sv-storage-usb-${owner:-root}.last" 2>/dev/null || true
 }
 
 # cmd_usb
-#   Asks which USB drive to format and how, then formats it and opens it
-#   in Files.
+#   Asks which USB drive to format and how, then formats it through udisks
+#   and opens it in Files. Anyone signed in at the computer may use it.
 #   Arguments: usb options (see Usage)
 #   Returns: 0 on success; exits non-zero on failure or cancel
 cmd_usb() {
-    local dev="" fs="" name="" owner="" mount=1 reason part
+    local dev="" fs="" name="" mount=1 reason
     while (( $# )); do
         case "$1" in
             --fs) fs="${2:?}"; shift ;;
             --name) name="${2:?}"; shift ;;
-            --owner) owner="${2:?}"; shift ;;
             --no-mount) mount=0 ;;
             -*) die "unknown option $1" 64 ;;
             *) dev="$1" ;;
@@ -1820,30 +1897,11 @@ cmd_usb() {
     name="$(validate_name "${fs}" "${name}")" || exit 64
     confirm_erase "${dev}" "one ${fs} partition called \"${name}\" (MBR table, for the widest compatibility)"
 
-    [[ -n "${owner}" ]] || owner="$(invoking_user)"
     if (( DRY_RUN )); then
         say "Dry run: these are the steps; nothing is changed"
-        apply_usb "${dev}" "${fs}" "${name}" "${owner}"
-        return 0
     fi
-    if (( EUID != 0 )); then
-        run_as_admin usb "${dev}" --fs "${fs}" --name "${name}" --owner "${owner}" --no-mount --confirmed || return
-        # Mounted by the person rather than root, so it opens under their
-        # name in Files like any stick they plug in.
-        part="$(lsblk -nlpo PATH,TYPE "${dev}" | awk '$2 == "part" {print $1; exit}')"
-        if (( mount )) && [[ -n "${part}" ]]; then
-            udisksctl mount --no-user-interaction -b "${part}" || echo "Unplug the stick and plug it back in to open it."
-        fi
-    else
-        apply_usb "${dev}" "${fs}" "${name}" "${owner}"
-        part="$(lsblk -nlpo PATH,TYPE "${dev}" | awk '$2 == "part" {print $1; exit}')"
-        if (( mount )) && [[ -n "${owner}" && -n "${part}" ]]; then
-            runuser -u "${owner}" -- udisksctl mount --no-user-interaction -b "${part}" 2>/dev/null \
-                || echo "Unplug the stick and plug it back in to open it."
-        fi
-    fi
-    # The elevated copy stays quiet here; the person's own copy reports.
-    (( CONFIRMED )) && return 0
+    apply_usb "${dev}" "${fs}" "${name}" "${mount}"
+    (( DRY_RUN )) && return 0
     say "Done"
     echo "The USB drive \"${name}\" is ready."
 }
@@ -1885,10 +1943,17 @@ main() {
     case "${cmd}" in
         list)      cmd_list || status=$? ;;
         check)     cmd_check || status=$? ;;
-        setup)     ( cmd_setup "$@" ) || status=$? ;;
+        setup|remove|cleanup)
+            if ! admin_allowed; then
+                status=77
+            elif [[ "${cmd}" == setup ]]; then
+                ( cmd_setup "$@" ) || status=$?
+            elif [[ "${cmd}" == remove ]]; then
+                ( cmd_remove "$@" ) || status=$?
+            else
+                ( cmd_cleanup ) || status=$?
+            fi ;;
         usb)       ( cmd_usb "$@" ) || status=$? ;;
-        remove)    ( cmd_remove "$@" ) || status=$? ;;
-        cleanup)   ( cmd_cleanup ) || status=$? ;;
         run-moves) cmd_run_moves || status=$? ;;
         help)      usage ;;
         *)         usage >&2; return 64 ;;

@@ -255,6 +255,41 @@ sync_share_bookmarks() {
     done < "${list}"
 }
 
+# sync_storage_launcher
+#   Shows the Set Up Drives launcher to administrators only. The system copy
+#   is hidden (NoDisplay=true) because setting up drives needs an
+#   administrator; each administrator gets a visible copy in their own
+#   applications folder, made from the system file at every sign-in so it
+#   never drifts from it and follows the account when it is made or unmade
+#   an administrator. A copy this hook did not write is left alone.
+#   Arguments: none
+#   Returns: 0 always
+sync_storage_launcher() {
+    local system=/usr/share/applications/shatteredvales-storage.desktop
+    local dir="${XDG_DATA_HOME:-${HOME}/.local/share}/applications"
+    local copy="${dir}/shatteredvales-storage.desktop" marker="X-ShatteredVales-Generated=true"
+    if [[ -f "${copy}" ]] && ! grep -qxF "${marker}" "${copy}"; then
+        return 0
+    fi
+    if is_admin && [[ -f "${system}" ]]; then
+        mkdir -p "${dir}"
+        # The marker goes right after the group header so it stays in the
+        # [Desktop Entry] group, before any [Desktop Action] groups.
+        if awk -v marker="${marker}" '
+            $0 == "NoDisplay=true" { $0 = "NoDisplay=false" }
+            { print }
+            $0 == "[Desktop Entry]" { print marker }
+        ' "${system}" > "${copy}.tmp"; then
+            mv "${copy}.tmp" "${copy}"
+        else
+            rm -f "${copy}.tmp"
+        fi
+    else
+        rm -f "${copy}"
+    fi
+    return 0
+}
+
 # notify_new_drives
 #   Tells administrators about internal drives that are not used for
 #   anything yet and offers to set them up. USB and other external drives
@@ -356,7 +391,8 @@ register_steps() {
     STEPS=("terminal-palette-v1 step_terminal_palette")
     # Last, because the installs download several hundred MB.
     LATE_STEPS=("artcraft-apps-v1 step_artcraft_apps")
-    LOGIN_HOOKS=(notify_new_drives)
+    # The launcher first: the new-drive alert's Set Up button opens it.
+    LOGIN_HOOKS=(sync_storage_launcher notify_new_drives)
     load_dropins
 }
 

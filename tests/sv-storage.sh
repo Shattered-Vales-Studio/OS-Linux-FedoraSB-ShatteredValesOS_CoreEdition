@@ -66,7 +66,8 @@ lacks() {
 }
 
 # tool
-#   Runs sv-storage against the fixture.
+#   Runs sv-storage against the fixture, as an administrator unless ADMIN
+#   is set to 0.
 #   Arguments: sv-storage arguments
 #   Output: its combined output; the exit status is appended as "rc=N"
 #   Returns: 0 always
@@ -74,7 +75,8 @@ tool() {
     local rc=0 out
     out="$(SV_STORAGE_LSBLK_JSON="${ROOT}/tests/fixtures/sv-storage-lsblk.json" \
         SV_STORAGE_SYSTEM_DISKS="${SYSTEM_DISKS-}" SV_STORAGE_SYSFS="${WORK}/sys" \
-        SV_STORAGE_FSTAB="${WORK}/fstab" bash "${TOOL}" "$@" </dev/null 2>&1)" || rc=$?
+        SV_STORAGE_FSTAB="${WORK}/fstab" SV_STORAGE_ADMIN="${ADMIN:-1}" \
+        bash "${TOOL}" "$@" </dev/null 2>&1)" || rc=$?
     printf '%s\nrc=%d\n' "${out}" "${rc}"
 }
 
@@ -200,19 +202,35 @@ expect "usb: refuses an internal drive" "$(contains "${out}" "not a USB or remov
 out="$(tool usb nvme0n1 --fs exfat --name USB --yes --dry-run)"
 expect "usb: refuses the system drive" "$(contains "${out}" "holds the system")" "${out}"
 out="$(tool usb sdc --fs exfat --name "My Stick" --yes --dry-run)"
-expect "usb dry run: unmounts through udisks" "$(contains "${out}" "udisksctl unmount --no-user-interaction -b /dev/sdc1")" "${out}"
-expect "usb dry run: wipes each partition" "$(contains "${out}" "wipefs -a /dev/sdc2")" "${out}"
-expect "usb dry run: zeroes the start" "$(contains "${out}" "dd if=/dev/zero of=/dev/sdc bs=512 count=4096")" "${out}"
-expect "usb dry run: zeroes the end (backup GPT)" "$(contains "${out}" "seek=60551168")" "${out}"
-expect "usb dry run: MBR with type 7" "$(contains "${out}" "label: dos; type=7")" "${out}"
-expect "usb dry run: exFAT label" "$(contains "${out}" "mkfs.exfat -L My\\ Stick /dev/sdc1")" "${out}"
+expect "usb dry run: unmounts through udisks" "$(contains "${out}" "would ask udisks to unmount /dev/sdc1")" "${out}"
+expect "usb dry run: udisks wipes every signature first" "$(contains "${out}" "wipe every signature on /dev/sdc (Block.Format empty)")" "${out}"
+expect "usb dry run: new MBR table through udisks" "$(contains "${out}" "new MBR table on /dev/sdc (Block.Format dos)")" "${out}"
+expect "usb dry run: exFAT partition type 0x07 with its label" "$(contains "${out}" "type 0x07 and format it as exfat labelled My Stick")" "${out}"
+expect "usb dry run: opens it in Files" "$(contains "${out}" "mount it so it opens in Files")" "${out}"
+expect "usb dry run: never runs root tools" \
+    "$(for c in wipefs sfdisk "dd if" mkfs pkexec sudo; do [[ "${out}" == *"${c}"* ]] && echo no && break; done; echo ok)" "${out}"
+ADMIN=0
+out="$(tool usb sdc --fs exfat --name USB --yes --dry-run)"
+expect "usb: anyone may format a USB stick" "$(contains "${out}" "Block.Format empty")" "${out}"
+expect "usb: no administrator refusal" "$(lacks "${out}" "needs an administrator")" "${out}"
+out="$(tool setup sda --role storage --name X --fs ext4 --erase --yes --dry-run)"
+expect "setup: refused to non-administrators" "$(contains "${out}" "Setting up drives needs an administrator account")" "${out}"
+expect "setup: non-administrator exit code 77" "$(contains "${out}" "rc=77")" "${out}"
+expect "setup: refused before any drive work" "$(lacks "${out}" "would run")" "${out}"
+out="$(tool remove Media --yes --dry-run)"
+expect "remove: refused to non-administrators" "$(contains "${out}" "rc=77")" "${out}"
+out="$(tool cleanup --yes --dry-run)"
+expect "cleanup: refused to non-administrators" "$(contains "${out}" "rc=77")" "${out}"
+out="$(tool list)"
+expect "list: open to everyone" "$(contains "${out}" "rc=0")" "${out}"
+ADMIN=1
 out="$(tool usb sdc --fs fat32 --name "my stick" --yes --dry-run)"
-expect "usb dry run: FAT label uppercased" "$(contains "${out}" "mkfs.vfat -F 32 -n MY\\ STICK")" "${out}"
+expect "usb dry run: FAT32 partition type 0x0c, label uppercased" "$(contains "${out}" "type 0x0c and format it as vfat labelled MY STICK")" "${out}"
 expect "usb dry run: FAT 4 GB warning" "$(contains "${out}" "4 GB")" "${out}"
 out="$(tool usb sdc --fs fat32 --name "much too long" --yes --dry-run)"
 expect "usb: FAT name over 11 characters refused" "$(contains "${out}" "too long")" "${out}"
 out="$(tool usb sdd --fs ext4 --name Backup --yes --dry-run)"
-expect "usb: USB hard drive can be formatted" "$(contains "${out}" "mkfs.ext4")" "${out}"
+expect "usb: USB hard drive can be formatted" "$(contains "${out}" "format it as ext4 labelled Backup, owned by you")" "${out}"
 
 out="$(tool remove Media --yes --dry-run)"
 expect "remove dry run: removes the fstab entry" "$(contains "${out}" "UUID=u-media")" "${out}"

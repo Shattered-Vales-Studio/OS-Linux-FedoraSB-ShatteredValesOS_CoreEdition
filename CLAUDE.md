@@ -126,6 +126,14 @@ ghcr.io/blue-build/base-images/fedora-silverblue(-nvidia-open)
   `shatteredvales-storage-move.service`, before anyone can sign in, and
   the old copy is kept until `sv-storage cleanup`. New-drive alerts cover
   internal drives only. Run `tests/sv-storage.sh` after changing it.
+- `sv-storage setup`, `remove` and `cleanup` are for administrators
+  (wheel) and refuse everyone else before any password prompt; the Set Up
+  Drives launcher is hidden system-wide and shown to administrators by a
+  per-account copy that `first-login.sh` keeps in step. `sv-storage usb`
+  is for everyone: it runs as the person through udisks, whose polkit
+  defaults allow changing removable and USB drives in an active session
+  and never the computer's own drives. Never add a polkit rule that
+  widens what non-administrators may format.
 - The repository is public: anyone may build and use these images.
 
 ## Code standards (organization policy)
