@@ -12,6 +12,9 @@ modules:
         - shatteredvales-signed-switch.service
         # Copies the branded boot menu theme into /boot.
         - shatteredvales-grub-theme.service
+        # Moves folders onto drives set up with sv-storage at the next start;
+        # does nothing unless a move is waiting.
+        - shatteredvales-storage-move.service
     user:
       enabled:
         # Nudges people to restart when an update has waited 3+ days.

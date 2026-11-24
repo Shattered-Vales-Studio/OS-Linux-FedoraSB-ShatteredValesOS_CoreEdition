@@ -82,6 +82,29 @@ path /usr/lib/systemd/system/shatteredvales-signed-switch.service
 path /usr/share/applications/shatteredvales-update.desktop
 path /usr/share/icons/hicolor/scalable/apps/shatteredvales-update.svg
 
+# Drive set-up and USB formatting (sv-storage) and the tools it runs.
+path /usr/bin/sv-storage
+path /usr/bin/sv-format-usb
+path /usr/lib/systemd/system/shatteredvales-storage-move.service
+path /etc/systemd/system/multi-user.target.wants/shatteredvales-storage-move.service
+path /usr/share/applications/shatteredvales-storage.desktop
+path /usr/share/applications/shatteredvales-format-usb.desktop
+path /usr/share/icons/hicolor/scalable/apps/shatteredvales-storage.svg
+path /usr/share/icons/hicolor/scalable/apps/shatteredvales-format-usb.svg
+path /usr/bin/ptyxis
+path /usr/bin/gtk-launch
+path /usr/bin/sfdisk
+path /usr/bin/wipefs
+path /usr/bin/udisksctl
+path /usr/bin/setfacl
+path /usr/bin/rsync
+path /usr/bin/mkfs.exfat
+path /usr/bin/mkfs.vfat
+path /usr/bin/mkntfs
+path /usr/bin/mkfs.xfs
+path /usr/bin/mkfs.btrfs
+path /usr/bin/restorecon
+
 # Default apps and browser policy.
 path /etc/xdg/mimeapps.list
 path /etc/firefox/policies/policies.json

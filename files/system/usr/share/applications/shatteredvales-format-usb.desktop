@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Format USB Drive
+GenericName=Erase and format a USB stick
+Comment=Erase a USB stick or memory card so it works on Windows, Mac, TVs and cameras, including sticks used for installers
+Exec=ptyxis -- sv-format-usb --wait
+Icon=shatteredvales-format-usb
+Terminal=false
+Categories=System;
+Keywords=usb;stick;flash;format;erase;exfat;fat32;ntfs;memory card;sd card;etcher;
