@@ -1,0 +1,466 @@
+{
+  "blockdevices": [
+    {
+      "name": "loop0",
+      "path": "/dev/loop0",
+      "type": "loop",
+      "size": 104857600,
+      "model": null,
+      "vendor": null,
+      "serial": null,
+      "ptuuid": null,
+      "tran": null,
+      "rota": false,
+      "rm": false,
+      "hotplug": false,
+      "ro": true,
+      "fstype": "squashfs",
+      "label": null,
+      "uuid": null,
+      "mountpoints": [
+        "/var/lib/snap"
+      ],
+      "pkname": null
+    },
+    {
+      "name": "sr0",
+      "path": "/dev/sr0",
+      "type": "rom",
+      "size": 1073741824,
+      "model": "DVD-RW",
+      "vendor": "HL-DT-ST",
+      "serial": "X1",
+      "ptuuid": null,
+      "tran": "sata",
+      "rota": true,
+      "rm": true,
+      "hotplug": true,
+      "ro": false,
+      "fstype": null,
+      "label": null,
+      "uuid": null,
+      "mountpoints": [
+        null
+      ],
+      "pkname": null
+    },
+    {
+      "name": "zram0",
+      "path": "/dev/zram0",
+      "type": "disk",
+      "size": 8589934592,
+      "model": null,
+      "vendor": null,
+      "serial": null,
+      "ptuuid": null,
+      "tran": null,
+      "rota": false,
+      "rm": false,
+      "hotplug": false,
+      "ro": false,
+      "fstype": "swap",
+      "label": "zram0",
+      "uuid": "z-1",
+      "mountpoints": [
+        "[SWAP]"
+      ],
+      "pkname": null
+    },
+    {
+      "name": "nvme0n1",
+      "path": "/dev/nvme0n1",
+      "type": "disk",
+      "size": 2000398934016,
+      "model": "Samsung SSD 990 PRO 2TB",
+      "vendor": null,
+      "serial": "S7SYS0001",
+      "ptuuid": "pt-sys",
+      "tran": "nvme",
+      "rota": false,
+      "rm": false,
+      "hotplug": false,
+      "ro": false,
+      "fstype": null,
+      "label": null,
+      "uuid": null,
+      "mountpoints": [
+        null
+      ],
+      "pkname": null,
+      "children": [
+        {
+          "name": "nvme0n1p1",
+          "path": "/dev/nvme0n1p1",
+          "type": "part",
+          "size": 629145600,
+          "fstype": "vfat",
+          "label": null,
+          "uuid": "AAAA-BBBB",
+          "mountpoints": [
+            "/boot/efi"
+          ],
+          "pkname": "nvme0n1"
+        },
+        {
+          "name": "nvme0n1p2",
+          "path": "/dev/nvme0n1p2",
+          "type": "part",
+          "size": 2147483648,
+          "fstype": "ext4",
+          "label": "boot",
+          "uuid": "u-boot",
+          "mountpoints": [
+            "/boot"
+          ],
+          "pkname": "nvme0n1"
+        },
+        {
+          "name": "nvme0n1p3",
+          "path": "/dev/nvme0n1p3",
+          "type": "part",
+          "size": 1997621223424,
+          "fstype": "btrfs",
+          "label": "fedora",
+          "uuid": "u-root",
+          "mountpoints": [
+            "/var",
+            "/sysroot/ostree/deploy/default/var",
+            "/sysroot",
+            "/etc"
+          ],
+          "pkname": "nvme0n1"
+        }
+      ]
+    },
+    {
+      "name": "nvme1n1",
+      "path": "/dev/nvme1n1",
+      "type": "disk",
+      "size": 1000204886016,
+      "model": "WD_BLACK SN850X 1000GB",
+      "vendor": null,
+      "serial": "WD-NEW-NVME",
+      "ptuuid": null,
+      "tran": "nvme",
+      "rota": false,
+      "rm": false,
+      "hotplug": false,
+      "ro": false,
+      "fstype": null,
+      "label": null,
+      "uuid": null,
+      "mountpoints": [
+        null
+      ],
+      "pkname": null
+    },
+    {
+      "name": "sda",
+      "path": "/dev/sda",
+      "type": "disk",
+      "size": 4000787030016,
+      "model": "ST4000DM004-2U9104",
+      "vendor": "ATA     ",
+      "serial": "ZFN-HDD-1",
+      "ptuuid": null,
+      "tran": "sata",
+      "rota": true,
+      "rm": false,
+      "hotplug": false,
+      "ro": false,
+      "fstype": null,
+      "label": null,
+      "uuid": null,
+      "mountpoints": [
+        null
+      ],
+      "pkname": null
+    },
+    {
+      "name": "sdb",
+      "path": "/dev/sdb",
+      "type": "disk",
+      "size": 500107862016,
+      "model": "Samsung SSD 870 EVO 500GB",
+      "vendor": "ATA     ",
+      "serial": "S6PX-OLD",
+      "ptuuid": "pt-sdb",
+      "tran": "sata",
+      "rota": false,
+      "rm": false,
+      "hotplug": false,
+      "ro": false,
+      "fstype": null,
+      "label": null,
+      "uuid": null,
+      "mountpoints": [
+        null
+      ],
+      "pkname": null,
+      "children": [
+        {
+          "name": "sdb1",
+          "path": "/dev/sdb1",
+          "type": "part",
+          "size": 500106813440,
+          "fstype": "ext4",
+          "label": "Old Photos",
+          "uuid": "u-sdb1",
+          "mountpoints": [
+            "/var/home"
+          ],
+          "pkname": "sdb"
+        }
+      ]
+    },
+    {
+      "name": "sdc",
+      "path": "/dev/sdc",
+      "type": "disk",
+      "size": 31004295168,
+      "model": "Cruzer Blade",
+      "vendor": "SanDisk ",
+      "serial": "4C53-STICK",
+      "ptuuid": "0x1234",
+      "tran": "usb",
+      "rota": true,
+      "rm": true,
+      "hotplug": true,
+      "ro": false,
+      "fstype": "iso9660",
+      "label": "Fedora-WS-Live-45",
+      "uuid": "2026-11-01-00-00-00-00",
+      "mountpoints": [
+        null
+      ],
+      "pkname": null,
+      "children": [
+        {
+          "name": "sdc1",
+          "path": "/dev/sdc1",
+          "type": "part",
+          "size": 2400000000,
+          "fstype": "iso9660",
+          "label": "Fedora-WS-Live-45",
+          "uuid": "2026-11-01-00-00-00-00",
+          "mountpoints": [
+            "/run/media/chris/Fedora-WS-Live-45"
+          ],
+          "pkname": "sdc"
+        },
+        {
+          "name": "sdc2",
+          "path": "/dev/sdc2",
+          "type": "part",
+          "size": 31457280,
+          "fstype": "vfat",
+          "label": "ANACONDA",
+          "uuid": "EF-01",
+          "mountpoints": [
+            null
+          ],
+          "pkname": "sdc"
+        }
+      ]
+    },
+    {
+      "name": "sdd",
+      "path": "/dev/sdd",
+      "type": "disk",
+      "size": 5000981078016,
+      "model": "Expansion HDD",
+      "vendor": "Seagate ",
+      "serial": "NAAB-USBHDD",
+      "ptuuid": null,
+      "tran": "usb",
+      "rota": true,
+      "rm": false,
+      "hotplug": true,
+      "ro": false,
+      "fstype": null,
+      "label": null,
+      "uuid": null,
+      "mountpoints": [
+        null
+      ],
+      "pkname": null
+    },
+    {
+      "name": "sde",
+      "path": "/dev/sde",
+      "type": "disk",
+      "size": 2000398934016,
+      "model": "WDC WD20EZAZ",
+      "vendor": "ATA     ",
+      "serial": "WD-ESATA",
+      "ptuuid": null,
+      "tran": "sata",
+      "rota": true,
+      "rm": false,
+      "hotplug": true,
+      "ro": false,
+      "fstype": null,
+      "label": null,
+      "uuid": null,
+      "mountpoints": [
+        null
+      ],
+      "pkname": null
+    },
+    {
+      "name": "sdf",
+      "path": "/dev/sdf",
+      "type": "disk",
+      "size": 1000204886016,
+      "model": "CT1000MX500SSD1",
+      "vendor": "ATA     ",
+      "serial": "CT-LUKS",
+      "ptuuid": "pt-sdf",
+      "tran": "sata",
+      "rota": false,
+      "rm": false,
+      "hotplug": false,
+      "ro": false,
+      "fstype": null,
+      "label": null,
+      "uuid": null,
+      "mountpoints": [
+        null
+      ],
+      "pkname": null,
+      "children": [
+        {
+          "name": "sdf1",
+          "path": "/dev/sdf1",
+          "type": "part",
+          "size": 1000203837440,
+          "fstype": "crypto_LUKS",
+          "label": null,
+          "uuid": "u-luks",
+          "mountpoints": [
+            null
+          ],
+          "pkname": "sdf"
+        }
+      ]
+    },
+    {
+      "name": "sdg",
+      "path": "/dev/sdg",
+      "type": "disk",
+      "size": 8001563222016,
+      "model": "WDC WD80EFZZ",
+      "vendor": "ATA     ",
+      "serial": "WD-MEDIA",
+      "ptuuid": "pt-sdg",
+      "tran": "sata",
+      "rota": true,
+      "rm": false,
+      "hotplug": false,
+      "ro": false,
+      "fstype": null,
+      "label": null,
+      "uuid": null,
+      "mountpoints": [
+        null
+      ],
+      "pkname": null,
+      "children": [
+        {
+          "name": "sdg1",
+          "path": "/dev/sdg1",
+          "type": "part",
+          "size": 8001562173440,
+          "fstype": "ext4",
+          "label": "Media",
+          "uuid": "u-media",
+          "mountpoints": [
+            "/var/mnt/Media"
+          ],
+          "pkname": "sdg"
+        }
+      ]
+    },
+    {
+      "name": "sdh",
+      "path": "/dev/sdh",
+      "type": "disk",
+      "size": 1000204886016,
+      "model": "Portable SSD T7",
+      "vendor": "Samsung ",
+      "serial": "T7-UAS",
+      "ptuuid": null,
+      "tran": "sata",
+      "rota": false,
+      "rm": false,
+      "hotplug": false,
+      "ro": false,
+      "fstype": null,
+      "label": null,
+      "uuid": null,
+      "mountpoints": [
+        null
+      ],
+      "pkname": null
+    },
+    {
+      "name": "sdi",
+      "path": "/dev/sdi",
+      "type": "disk",
+      "size": 2000398934016,
+      "model": "ST2000DM008",
+      "vendor": "ATA     ",
+      "serial": "ST-APPS",
+      "ptuuid": "pt-sdi",
+      "tran": "sata",
+      "rota": true,
+      "rm": false,
+      "hotplug": false,
+      "ro": false,
+      "fstype": null,
+      "label": null,
+      "uuid": null,
+      "mountpoints": [
+        null
+      ],
+      "pkname": null,
+      "children": [
+        {
+          "name": "sdi1",
+          "path": "/dev/sdi1",
+          "type": "part",
+          "size": 2000397885440,
+          "fstype": "ext4",
+          "label": "Apps",
+          "uuid": "u-apps-unplugged",
+          "mountpoints": [
+            null
+          ],
+          "pkname": "sdi"
+        }
+      ]
+    },
+    {
+      "name": "sdj",
+      "path": "/dev/sdj",
+      "type": "disk",
+      "size": 0,
+      "model": "Card Reader",
+      "vendor": "Generic ",
+      "serial": "CR-EMPTY",
+      "ptuuid": null,
+      "tran": "usb",
+      "rota": false,
+      "rm": true,
+      "hotplug": true,
+      "ro": false,
+      "fstype": null,
+      "label": null,
+      "uuid": null,
+      "mountpoints": [
+        null
+      ],
+      "pkname": null
+    }
+  ]
+}

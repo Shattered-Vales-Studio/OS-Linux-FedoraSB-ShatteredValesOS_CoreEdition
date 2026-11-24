@@ -138,27 +138,65 @@ craft_installed() {
     flatpak info --user "$1" >/dev/null 2>&1 || flatpak info --system "$1" >/dev/null 2>&1
 }
 
+# craft_list_sum
+#   Fingerprints the edition's ArtCraft list, so a different list (after
+#   moving to another edition, or a new image adding apps) is noticed.
+#   Arguments: none
+#   Output: the list's checksum on stdout
+#   Returns: 0 always
+craft_list_sum() {
+    sha256sum "${CRAFT_LIST}" 2>/dev/null | cut -d' ' -f1
+}
+
+# recheck_craft_list
+#   Marks the ArtCraft install step as pending again when the list differs
+#   from the one last installed. The step only installs apps that are
+#   missing, so this adds an edition's extra apps without touching the
+#   ones the person already has. Accounts set up before the fingerprint
+#   existed are rechecked once, which installs nothing when nothing is
+#   missing.
+#   Arguments: none
+#   Returns: 0 always
+recheck_craft_list() {
+    local done_mark="${STATE_DIR}/artcraft-apps-v1.done" sum_file="${STATE_DIR}/artcraft-apps.list.sum"
+    [[ -f "${done_mark}" ]] || return 0
+    [[ "$(cat "${sum_file}" 2>/dev/null)" == "$(craft_list_sum)" ]] && return 0
+    echo "The ArtCraft app list changed; installing any apps that are missing"
+    rm -f "${done_mark}"
+}
+
 # step_artcraft_apps
 #   Installs the edition's Craft apps (listed in artcraft-apps.list) for
-#   this user. Apps the user already has are skipped; failures are retried
-#   at the next login.
+#   this user. Apps the user already has are skipped, and with nothing
+#   missing it finishes quietly without going online. Records the list's
+#   fingerprint so a changed list runs it again; failures are retried at
+#   the next login.
 #   Returns: 0 if every app is installed, 1 otherwise
 step_artcraft_apps() {
-    local id flatpak_id repo work failed=0
+    local id flatpak_id repo work entry failed=0
+    local -a missing=()
+    while read -r id flatpak_id repo; do
+        [[ -z "${id}" || "${id}" == \#* ]] && continue
+        craft_installed "${flatpak_id}" || missing+=("${id} ${repo}")
+    done < "${CRAFT_LIST}"
+    if (( ${#missing[@]} == 0 )); then
+        craft_list_sum > "${STATE_DIR}/artcraft-apps.list.sum"
+        return 0
+    fi
     wait_for_network || return 1
     # Bundles pull their runtime from the user's Flathub remote.
     flatpak remote-add --user --if-not-exists flathub \
         https://dl.flathub.org/repo/flathub.flatpakrepo || return 1
-    notify "Installing ArtCraft apps" "About 1 GB in the background; ArtCraft Launcher keeps them updated afterwards."
+    notify "Installing ArtCraft apps" "${#missing[@]} apps download in the background; ArtCraft Launcher keeps them updated afterwards."
     work="$(mktemp -d)"
-    while read -r id flatpak_id repo; do
-        [[ -z "${id}" || "${id}" == \#* ]] && continue
-        craft_installed "${flatpak_id}" && continue
+    for entry in "${missing[@]}"; do
+        read -r id repo <<<"${entry}"
         echo "Installing ${id} from ${repo}"
         install_craft_app "${id}" "${repo}" "${work}" || { echo "Failed: ${id}"; failed=1; }
-    done < "${CRAFT_LIST}"
+    done
     rm -rf "${work}"
     (( failed == 0 )) || return 1
+    craft_list_sum > "${STATE_DIR}/artcraft-apps.list.sum"
     notify "ArtCraft apps installed" "Open ArtCraft Launcher to see the suite and check for updates."
 }
 
@@ -255,6 +293,41 @@ sync_share_bookmarks() {
     done < "${list}"
 }
 
+# sync_storage_launcher
+#   Shows the Set Up Drives launcher to administrators only. The system copy
+#   is hidden (NoDisplay=true) because setting up drives needs an
+#   administrator; each administrator gets a visible copy in their own
+#   applications folder, made from the system file at every sign-in so it
+#   never drifts from it and follows the account when it is made or unmade
+#   an administrator. A copy this hook did not write is left alone.
+#   Arguments: none
+#   Returns: 0 always
+sync_storage_launcher() {
+    local system=/usr/share/applications/shatteredvales-storage.desktop
+    local dir="${XDG_DATA_HOME:-${HOME}/.local/share}/applications"
+    local copy="${dir}/shatteredvales-storage.desktop" marker="X-ShatteredVales-Generated=true"
+    if [[ -f "${copy}" ]] && ! grep -qxF "${marker}" "${copy}"; then
+        return 0
+    fi
+    if is_admin && [[ -f "${system}" ]]; then
+        mkdir -p "${dir}"
+        # The marker goes right after the group header so it stays in the
+        # [Desktop Entry] group, before any [Desktop Action] groups.
+        if awk -v marker="${marker}" '
+            $0 == "NoDisplay=true" { $0 = "NoDisplay=false" }
+            { print }
+            $0 == "[Desktop Entry]" { print marker }
+        ' "${system}" > "${copy}.tmp"; then
+            mv "${copy}.tmp" "${copy}"
+        else
+            rm -f "${copy}.tmp"
+        fi
+    else
+        rm -f "${copy}"
+    fi
+    return 0
+}
+
 # notify_new_drives
 #   Tells administrators about internal drives that are not used for
 #   anything yet and offers to set them up. USB and other external drives
@@ -287,7 +360,10 @@ notify_new_drives() {
     local body="It is not used for anything yet. Set it up for storage, apps or home folders?"
     if (( ${#titles[@]} > 1 )); then
         summary="${#titles[@]} new drives found"
-        body="$(printf '%s\n' "${titles[@]}")
+        # One bullet per drive and a blank line before the question, so the
+        # names stay apart even where the notification is shown on one line.
+        body="$(printf '• %s\n' "${titles[@]}")
+
 They are not used for anything yet. Set them up for storage, apps or home folders?"
     fi
     # The script runs detached with setsid; its arguments are the dismissed
@@ -356,7 +432,8 @@ register_steps() {
     STEPS=("terminal-palette-v1 step_terminal_palette")
     # Last, because the installs download several hundred MB.
     LATE_STEPS=("artcraft-apps-v1 step_artcraft_apps")
-    LOGIN_HOOKS=(notify_new_drives)
+    # The launcher first: the new-drive alert's Set Up button opens it.
+    LOGIN_HOOKS=(sync_storage_launcher notify_new_drives)
     load_dropins
 }
 
@@ -386,6 +463,7 @@ main() {
     sync_user_icon || failed=1
     sync_share_bookmarks
     run_steps "${STEPS[@]}" || failed=1
+    recheck_craft_list
     run_steps "${LATE_STEPS[@]}" || failed=1
 
     if (( failed )); then

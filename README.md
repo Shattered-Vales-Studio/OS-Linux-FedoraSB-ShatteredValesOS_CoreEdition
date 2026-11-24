@@ -54,18 +54,23 @@ misbehaves.
 
 ## Drives
 
-- **Set Up Drives** (in the app grid) walks through using an extra
+- **Set Up Drives** (in the app grid of administrators' accounts) walks
+  through using an extra
   internal drive: as a **storage** folder for big files (it appears in the
   Files sidebar), or as the new home of **apps**, everyone's **home
   folders** or **containers**. It shows the drive's model, size and type,
   explains each choice and asks you to type the drive's name before
-  erasing anything. Apps, home folders and containers move at the next
-  restart, before anyone signs in; the old copy is kept until you run
-  `sv-storage cleanup`.
-- **Format USB Drive** erases a USB stick or memory card for Windows, Mac,
+  erasing anything. It checks first that the folder fits on the drive.
+  Apps, home folders and containers move at the next restart, before
+  anyone signs in; the old copy is kept until you run `sv-storage
+  cleanup`. Setting up drives is for administrators only:
+  anyone else is told to ask an administrator, and the launcher only
+  appears for administrators.
+- **Format USB Drive**, for everyone and without a password, erases a USB stick or memory card for Windows, Mac,
   TVs and cameras (exFAT), old devices (FAT32), Windows (NTFS) or Linux
   (ext4). It also fixes sticks that were used for an installer with
-  balenaEtcher.
+  balenaEtcher. It only ever offers USB sticks, memory cards and other
+  removable or USB drives.
 - The drive holding the system is never offered, and extra drives are set
   up so the computer still starts when one is missing.
 - Administrators get a notification when a new **internal** drive is not
@@ -79,10 +84,10 @@ misbehaves.
 | Command | Does |
 |---|---|
 | `sv-storage` | Lists every drive and what it is used for |
-| `sv-storage setup [drive]` | Sets up an unused drive |
-| `sv-storage usb [drive]` (or `sv-format-usb`) | Formats a USB stick or card |
-| `sv-storage remove [name]` | Stops using a storage drive (keeps its files) |
-| `sv-storage cleanup` | Frees the space of old copies after a move |
+| `sv-storage setup [drive]` | Sets up an unused drive (administrators) |
+| `sv-storage usb [drive]` (or `sv-format-usb`) | Formats a USB stick or card (anyone) |
+| `sv-storage remove [name]` | Stops using a storage drive, keeps its files (administrators) |
+| `sv-storage cleanup` | Frees the space of old copies after a move (administrators) |
 
 Add `--dry-run` to `setup`, `usb` or `remove` to see exactly what would be
 done without changing anything.

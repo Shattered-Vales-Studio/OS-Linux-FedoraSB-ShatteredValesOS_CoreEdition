@@ -10,7 +10,10 @@
 #   mode sv-storage refuses every change except --dry-run.
 #
 # Inputs:
-#   tests/fixtures/sv-storage-lsblk.json
+#   tests/fixtures/sv-storage-lsblk.json (a Fedora Atomic layout: /var/home
+#   is a btrfs subvolume on the system NVMe)
+#   tests/fixtures/sv-storage-lsblk-home-moved.json (the same computer with
+#   the home folders already on a drive of their own)
 #
 # Usage:
 #   tests/sv-storage.sh      (Linux; needs bash, jq and util-linux)
@@ -66,15 +69,19 @@ lacks() {
 }
 
 # tool
-#   Runs sv-storage against the fixture.
+#   Runs sv-storage against the fixture (FIXTURE picks another one), as an
+#   administrator unless ADMIN is set to 0. SOURCE_BYTES stands in for the
+#   size of the folder a move would copy.
 #   Arguments: sv-storage arguments
 #   Output: its combined output; the exit status is appended as "rc=N"
 #   Returns: 0 always
 tool() {
     local rc=0 out
-    out="$(SV_STORAGE_LSBLK_JSON="${ROOT}/tests/fixtures/sv-storage-lsblk.json" \
+    out="$(SV_STORAGE_LSBLK_JSON="${FIXTURE:-${ROOT}/tests/fixtures/sv-storage-lsblk.json}" \
         SV_STORAGE_SYSTEM_DISKS="${SYSTEM_DISKS-}" SV_STORAGE_SYSFS="${WORK}/sys" \
-        SV_STORAGE_FSTAB="${WORK}/fstab" bash "${TOOL}" "$@" </dev/null 2>&1)" || rc=$?
+        SV_STORAGE_FSTAB="${WORK}/fstab" SV_STORAGE_ADMIN="${ADMIN:-1}" \
+        SV_STORAGE_SOURCE_BYTES="${SOURCE_BYTES:-}" \
+        bash "${TOOL}" "$@" </dev/null 2>&1)" || rc=$?
     printf '%s\nrc=%d\n' "${out}" "${rc}"
 }
 
@@ -182,6 +189,22 @@ out="$(tool setup nvme1n1 --role apps --name Apps --fs ext4 --erase --yes --dry-
 expect "setup dry run: NVMe partition is p1" "$(contains "${out}" "/dev/nvme1n1p1")" "${out}"
 expect "setup dry run: apps move is queued for boot" "$(contains "${out}" "apps <new-uuid> /var/lib/flatpak")" "${out}"
 expect "setup dry run: move does not touch fstab now" "$(lacks "${out}" "fstab (after")" "${out}"
+out="$(tool setup nvme1n1 --role homes --name Homes --fs ext4 --erase --yes --dry-run)"
+expect "homes: offered while /var/home is a subvolume on the system drive" "$(contains "${out}" "homes <new-uuid> /var/home")" "${out}"
+out="$(FIXTURE="${ROOT}/tests/fixtures/sv-storage-lsblk-home-moved.json" tool setup nvme1n1 --role homes --name Homes --fs ext4 --erase --yes --dry-run)"
+expect "homes: not offered once /var/home is on a drive of its own" "$(contains "${out}" "not possible")" "${out}"
+out="$(FIXTURE="${ROOT}/tests/fixtures/sv-storage-lsblk-home-moved.json" tool list)"
+expect "homes: the drive holding /var/home shows its role" "$(contains "$(grep -A1 '^  sdb ' <<<"${out}")" "/var/home")" "${out}"
+out="$(SOURCE_BYTES=2000000000000 tool setup nvme1n1 --role apps --name Apps --fs ext4 --erase --yes --dry-run)"
+expect "space: a move that does not fit is refused" "$(contains "${out}" "need about 2.2 TB, but this drive holds about 930 GB")" "${out}"
+expect "space: refused before the drive is touched" "$(lacks "${out}" "would run")" "${out}"
+expect "space: refusal exits 1" "$(contains "${out}" "rc=1")" "${out}"
+out="$(SOURCE_BYTES=850000000000 tool setup nvme1n1 --role apps --name Apps --fs ext4 --erase --yes --dry-run)"
+expect "space: just over the 10% margin is refused" "$(contains "${out}" "Choose a bigger drive")" "${out}"
+out="$(SOURCE_BYTES=100000000000 tool setup nvme1n1 --role apps --name Apps --fs ext4 --erase --yes --dry-run)"
+expect "space: a move that fits is queued" "$(contains "${out}" "apps <new-uuid> /var/lib/flatpak")" "${out}"
+out="$(SOURCE_BYTES=2000000000000 tool setup sda --role storage --name Archive --fs ext4 --erase --yes --dry-run)"
+expect "space: storage drives are not size-checked" "$(contains "${out}" "rc=0")" "${out}"
 out="$(tool setup sdb --role storage --name Photos --keep --yes --dry-run)"
 expect "setup dry run: keep mode does not wipe" "$(lacks "${out}" "wipefs")" "${out}"
 expect "setup dry run: keep mode mounts the existing filesystem" "$(contains "${out}" "UUID=u-sdb1  /var/mnt/Photos")" "${out}"
@@ -200,19 +223,35 @@ expect "usb: refuses an internal drive" "$(contains "${out}" "not a USB or remov
 out="$(tool usb nvme0n1 --fs exfat --name USB --yes --dry-run)"
 expect "usb: refuses the system drive" "$(contains "${out}" "holds the system")" "${out}"
 out="$(tool usb sdc --fs exfat --name "My Stick" --yes --dry-run)"
-expect "usb dry run: unmounts through udisks" "$(contains "${out}" "udisksctl unmount --no-user-interaction -b /dev/sdc1")" "${out}"
-expect "usb dry run: wipes each partition" "$(contains "${out}" "wipefs -a /dev/sdc2")" "${out}"
-expect "usb dry run: zeroes the start" "$(contains "${out}" "dd if=/dev/zero of=/dev/sdc bs=512 count=4096")" "${out}"
-expect "usb dry run: zeroes the end (backup GPT)" "$(contains "${out}" "seek=60551168")" "${out}"
-expect "usb dry run: MBR with type 7" "$(contains "${out}" "label: dos; type=7")" "${out}"
-expect "usb dry run: exFAT label" "$(contains "${out}" "mkfs.exfat -L My\\ Stick /dev/sdc1")" "${out}"
+expect "usb dry run: unmounts through udisks" "$(contains "${out}" "would ask udisks to unmount /dev/sdc1")" "${out}"
+expect "usb dry run: udisks wipes every signature first" "$(contains "${out}" "wipe every signature on /dev/sdc (Block.Format empty)")" "${out}"
+expect "usb dry run: new MBR table through udisks" "$(contains "${out}" "new MBR table on /dev/sdc (Block.Format dos)")" "${out}"
+expect "usb dry run: exFAT partition type 0x07 with its label" "$(contains "${out}" "type 0x07 and format it as exfat labelled My Stick")" "${out}"
+expect "usb dry run: opens it in Files" "$(contains "${out}" "mount it so it opens in Files")" "${out}"
+expect "usb dry run: never runs root tools" \
+    "$(for c in wipefs sfdisk "dd if" mkfs pkexec sudo; do [[ "${out}" == *"${c}"* ]] && echo no && break; done; echo ok)" "${out}"
+ADMIN=0
+out="$(tool usb sdc --fs exfat --name USB --yes --dry-run)"
+expect "usb: anyone may format a USB stick" "$(contains "${out}" "Block.Format empty")" "${out}"
+expect "usb: no administrator refusal" "$(lacks "${out}" "needs an administrator")" "${out}"
+out="$(tool setup sda --role storage --name X --fs ext4 --erase --yes --dry-run)"
+expect "setup: refused to non-administrators" "$(contains "${out}" "Setting up drives needs an administrator account")" "${out}"
+expect "setup: non-administrator exit code 77" "$(contains "${out}" "rc=77")" "${out}"
+expect "setup: refused before any drive work" "$(lacks "${out}" "would run")" "${out}"
+out="$(tool remove Media --yes --dry-run)"
+expect "remove: refused to non-administrators" "$(contains "${out}" "rc=77")" "${out}"
+out="$(tool cleanup --yes --dry-run)"
+expect "cleanup: refused to non-administrators" "$(contains "${out}" "rc=77")" "${out}"
+out="$(tool list)"
+expect "list: open to everyone" "$(contains "${out}" "rc=0")" "${out}"
+ADMIN=1
 out="$(tool usb sdc --fs fat32 --name "my stick" --yes --dry-run)"
-expect "usb dry run: FAT label uppercased" "$(contains "${out}" "mkfs.vfat -F 32 -n MY\\ STICK")" "${out}"
+expect "usb dry run: FAT32 partition type 0x0c, label uppercased" "$(contains "${out}" "type 0x0c and format it as vfat labelled MY STICK")" "${out}"
 expect "usb dry run: FAT 4 GB warning" "$(contains "${out}" "4 GB")" "${out}"
 out="$(tool usb sdc --fs fat32 --name "much too long" --yes --dry-run)"
 expect "usb: FAT name over 11 characters refused" "$(contains "${out}" "too long")" "${out}"
 out="$(tool usb sdd --fs ext4 --name Backup --yes --dry-run)"
-expect "usb: USB hard drive can be formatted" "$(contains "${out}" "mkfs.ext4")" "${out}"
+expect "usb: USB hard drive can be formatted" "$(contains "${out}" "format it as ext4 labelled Backup, owned by you")" "${out}"
 
 out="$(tool remove Media --yes --dry-run)"
 expect "remove dry run: removes the fstab entry" "$(contains "${out}" "UUID=u-media")" "${out}"
@@ -237,6 +276,14 @@ expect "fstab: NTFS uses the kernel driver and owner options" \
 expect "fstab: moved folders are ordered before local-fs.target" \
     "$(contains "$(mount_options ext4 homes "" 0 0)" "x-systemd.before=local-fs.target")"
 expect "fstab: escaping round-trips" "$( [[ "$(fstab_unescape "$(fstab_escape "My Media")")" == "My Media" ]] && echo ok)"
+expect "space: the real computer is never measured with a fixture" \
+    "$( [[ "$(SV_STORAGE_LSBLK_JSON=x role_bytes /)" == 0 ]] && echo ok)"
+printf '%s\n' "UUID=u-root / btrfs subvol=root,ro 0 0" "UUID=u-root /home btrfs subvol=home,compress=zstd:1 0 0" \
+    "UUID=u-root /var btrfs subvol=var 0 0" > "${WORK}/fstab-atomic"
+expect "subvolume: finds the installer's /home line for /var/home" \
+    "$( [[ "$(SV_STORAGE_FSTAB="${WORK}/fstab-atomic" bash -c 'source "$1"; fstab_line_for /var/home' _ "${TOOL}")" == 2 ]] && echo ok)"
+expect "subvolume: no line for a folder fstab does not mount" \
+    "$( [[ -z "$(SV_STORAGE_FSTAB="${WORK}/fstab-atomic" bash -c 'source "$1"; fstab_line_for /var/lib/flatpak' _ "${TOOL}")" ]] && echo ok)"
 expect "size: decimal units" "$( [[ "$(human_size 500107862016)" == "500 GB" && "$(human_size 31004295168)" == "31 GB" ]] && echo ok)"
 
 echo

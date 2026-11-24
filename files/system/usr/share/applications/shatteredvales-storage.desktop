@@ -6,6 +6,10 @@ Comment=Use an extra drive for storage, apps or home folders, step by step
 Exec=ptyxis -- sv-storage setup --wait
 Icon=shatteredvales-storage
 Terminal=false
+# Hidden for everyone: setting up drives is for administrators, and
+# first-login.sh (sync_storage_launcher) gives each administrator a visible
+# copy in their own applications folder at every sign-in.
+NoDisplay=true
 Categories=System;
 Keywords=drive;disk;hard drive;ssd;nvme;storage;mount;format;partition;
 Actions=list;cleanup;

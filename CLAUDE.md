@@ -123,9 +123,22 @@ ghcr.io/blue-build/base-images/fedora-silverblue(-nvidia-open)
   in the privileged step. Its fstab entries use the UUID with `nofail` and
   `x-systemd.device-timeout=10s`, so a missing drive never blocks start-up.
   Apps, home folders and containers move only at boot, through
-  `shatteredvales-storage-move.service`, before anyone can sign in, and
-  the old copy is kept until `sv-storage cleanup`. New-drive alerts cover
+  `shatteredvales-storage-move.service`, before anyone can sign in, after
+  a free-space check, and the old copy is kept until `sv-storage cleanup`.
+  A folder counts as moved only when it is mounted from a non-system
+  drive: on Fedora Atomic `/var/home` is a btrfs subvolume of the system
+  drive (the installer's `/home` fstab line), so a homes move switches
+  that line off with a marker comment and keeps the old copy in the
+  subvolume, which `cleanup` empties. New-drive alerts cover
   internal drives only. Run `tests/sv-storage.sh` after changing it.
+- `sv-storage setup`, `remove` and `cleanup` are for administrators
+  (wheel) and refuse everyone else before any password prompt; the Set Up
+  Drives launcher is hidden system-wide and shown to administrators by a
+  per-account copy that `first-login.sh` keeps in step. `sv-storage usb`
+  is for everyone: it runs as the person through udisks, whose polkit
+  defaults allow changing removable and USB drives in an active session
+  and never the computer's own drives. Never add a polkit rule that
+  widens what non-administrators may format.
 - The repository is public: anyone may build and use these images.
 
 ## Code standards (organization policy)
