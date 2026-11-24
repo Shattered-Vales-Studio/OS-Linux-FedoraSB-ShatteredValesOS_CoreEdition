@@ -110,6 +110,9 @@ render_inside() {
 
     local src=/core/branding/source dest=files/system out
     out="$(mktemp -d)"
+    # mktemp makes a private folder, and cp -a would give the target's
+    # files/system the same mode when Core renders itself.
+    chmod 755 "${out}"
     local tmp; tmp="$(mktemp -d)"
     local -a stops
     read -r -a stops <<<"${BRAND_FOIL_STOPS}"
