@@ -102,6 +102,28 @@ check_image() {
     fi
 }
 
+# check_selinux
+#   Reports whether SELinux is enforcing, or being turned back on by
+#   shatteredvales-selinux-repair.service (machines installed from older
+#   offline installers boot with it disabled).
+#   Arguments: none
+#   Returns: 0 always
+check_selinux() {
+    local mode repair
+    mode="$(getenforce 2>/dev/null || echo Unknown)"
+    repair="$(cat /var/lib/shatteredvales/selinux-repair 2>/dev/null || true)"
+    if [[ "${mode}" == Enforcing ]]; then
+        report PASS "SELinux" "Enforcing"
+    elif [[ "${repair}" == stage1 ]] \
+        || { [[ "${repair}" == "done" ]] && tr ' ' '\n' < /proc/cmdline | grep -qx enforcing=0; }; then
+        report INFO "SELinux" "${mode}; being repaired, restart to continue"
+    elif [[ "${mode}" == Disabled ]] && tr ' ' '\n' < /proc/cmdline | grep -qx selinux=0; then
+        report WARN "SELinux" "Disabled by the installer; restart and it repairs itself (or see the OS-Installer README)"
+    else
+        report WARN "SELinux" "${mode}; set SELINUX=enforcing in /etc/selinux/config and restart"
+    fi
+}
+
 # check_gpu
 #   Confirms the image variant matches the installed GPU.
 #   Arguments: none
@@ -246,6 +268,7 @@ run_checks() {
     echo "${BRAND_OS_NAME} ${BRAND_EDITION} report: $(hostname), user ${USER}, $(date '+%Y-%m-%d %H:%M %Z')"
     echo
     check_image
+    check_selinux
     check_gpu
     check_disk
     check_drives

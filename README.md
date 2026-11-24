@@ -92,6 +92,17 @@ misbehaves.
 Add `--dry-run` to `setup`, `usb` or `remove` to see exactly what would be
 done without changing anything.
 
+### SELinux on machines from older offline installers
+
+Offline USB installers built before the installer fix of 24 November 2026
+left SELinux switched off on the machines they installed. Those machines
+repair themselves after updating: the next restart runs SELinux in
+permissive mode and relabels files before anyone signs in, and the restart
+after that turns SELinux fully on. `sv-doctor` shows the progress. Nothing
+needs typing; the manual commands remain in the
+[OS-Installer README](https://github.com/Shattered-Vales-Studio/OS-Installer#readme)
+for reference.
+
 ## Installing
 
 ### On a new computer

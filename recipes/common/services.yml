@@ -15,6 +15,9 @@ modules:
         # Moves folders onto drives set up with sv-storage at the next start;
         # does nothing unless a move is waiting.
         - shatteredvales-storage-move.service
+        # Turns SELinux back on, one restart at a time, on machines whose
+        # older offline installer left it disabled; idle everywhere else.
+        - shatteredvales-selinux-repair.service
     user:
       enabled:
         # Nudges people to restart when an update has waited 3+ days.

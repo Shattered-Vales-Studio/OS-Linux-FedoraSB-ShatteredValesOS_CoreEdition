@@ -1,0 +1,17 @@
+[Unit]
+Description=Turn SELinux back on for machines installed with it disabled
+Documentation=https://github.com/Shattered-Vales-Studio/OS-Linux-FedoraSB-ShatteredValesOS_CoreEdition
+ConditionPathExists=/run/ostree-booted
+# Labels must be right before anyone signs in, so the relabel stage holds
+# sign-in until it is done.
+After=local-fs.target dbus.service
+Before=systemd-user-sessions.service display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/shatteredvales/selinux-repair.sh
+# Relabelling large home folders can take a while on hard drives.
+TimeoutStartSec=45min
+
+[Install]
+WantedBy=multi-user.target
