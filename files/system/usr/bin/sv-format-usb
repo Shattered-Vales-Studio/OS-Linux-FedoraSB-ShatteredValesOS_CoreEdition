@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+#
+# sv-format-usb
+#
+# Purpose:
+#   Formats a USB stick or memory card in plain language; a shorter name
+#   for `sv-storage usb`, used by the Format USB Drive launcher.
+#
+# Usage:
+#   sv-format-usb [DEVICE] [--fs exfat|fat32|ntfs|ext4] [--name NAME]
+#                 [--dry-run] [--wait]
+#
+# Exit codes:
+#   Those of sv-storage: 0 on success, 1 on failure, 3 when cancelled,
+#   64 on bad usage.
+
+set -euo pipefail
+
+exec /usr/bin/sv-storage usb "$@"

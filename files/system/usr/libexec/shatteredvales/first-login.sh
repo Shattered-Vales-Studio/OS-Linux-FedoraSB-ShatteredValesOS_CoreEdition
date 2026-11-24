@@ -21,6 +21,9 @@
 #
 # Usage:
 #   Runs automatically at login. Can be re-run manually with `sv-first-login`.
+#   `first-login.sh --list-steps` prints the id of every registered step,
+#   Core's and the editions', one per line, without running anything (used
+#   by sv-doctor).
 #
 # State:
 #   ~/.local/state/shatteredvales/<step>.done marks a finished step.
@@ -252,6 +255,57 @@ sync_share_bookmarks() {
     done < "${list}"
 }
 
+# notify_new_drives
+#   Tells administrators about internal drives that are not used for
+#   anything yet and offers to set them up. USB and other external drives
+#   are never mentioned (sv-storage check leaves them out). A drive someone
+#   chose "Don't Ask Again" for is remembered by its serial number and not
+#   mentioned again; closing the notification means "not now", so it comes
+#   back at the next login. The notification waits for an answer in its own
+#   background session, so login is never held up.
+#   Arguments: none
+#   Returns: 0 always
+notify_new_drives() {
+    local dismissed="${STATE_DIR}/drives-dismissed" found path id title status
+    local -a ids=() titles=()
+    is_admin || return 0
+    command -v sv-storage >/dev/null && command -v notify-send >/dev/null || return 0
+    [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || return 0
+    found="$(sv-storage check 2>/dev/null)"
+    status=$?
+    (( status == 10 )) || return 0
+    touch "${dismissed}"
+    while IFS=$'\t' read -r path id title; do
+        [[ -n "${path}" && -n "${id}" ]] || continue
+        grep -qxF "${id}" "${dismissed}" && continue
+        ids+=("${id}")
+        titles+=("${title}")
+    done <<<"${found}"
+    (( ${#ids[@]} )) || return 0
+    echo "New drives found: ${titles[*]}"
+    local summary="New drive found: ${titles[0]}"
+    local body="It is not used for anything yet. Set it up for storage, apps or home folders?"
+    if (( ${#titles[@]} > 1 )); then
+        summary="${#titles[@]} new drives found"
+        body="$(printf '%s\n' "${titles[@]}")
+They are not used for anything yet. Set them up for storage, apps or home folders?"
+    fi
+    # The script runs detached with setsid; its arguments are the dismissed
+    # file, the summary, the body and the drive ids.
+    # shellcheck disable=SC2016
+    setsid -f bash -c '
+        file="$1"; summary="$2"; body="$3"; shift 3
+        answer="$(notify-send --app-name="Shattered Vales" --icon=shatteredvales-storage \
+            --action=setup="Set Up" --action=ignore="Don'"'"'t Ask Again" --wait \
+            "${summary}" "${body}")"
+        case "${answer}" in
+            setup) gtk-launch shatteredvales-storage ;;
+            ignore) printf "%s\n" "$@" >> "${file}" ;;
+        esac
+    ' _ "${dismissed}" "${summary}" "${body}" "${ids[@]}" >/dev/null 2>&1 </dev/null
+    return 0
+}
+
 # step_terminal_palette
 #   Makes the Shattered Vales palette the default colours of the user's
 #   Ptyxis profile. Ptyxis reads custom palettes only from the user's data
@@ -293,20 +347,37 @@ load_dropins() {
     done
 }
 
-# main
-#   Runs every login hook and pending setup step, logging to the state
-#   directory.
+# register_steps
+#   Registers Core's hooks and steps, then loads the editions' drop-ins,
+#   which add theirs.
 #   Arguments: none
-#   Returns: 0 always; failed steps are retried at the next login
-main() {
-    mkdir -p "${STATE_DIR}"
-    exec >>"${LOG_FILE}" 2>&1
-
+#   Returns: 0 always
+register_steps() {
     STEPS=("terminal-palette-v1 step_terminal_palette")
     # Last, because the installs download several hundred MB.
     LATE_STEPS=("artcraft-apps-v1 step_artcraft_apps")
-    LOGIN_HOOKS=()
+    LOGIN_HOOKS=(notify_new_drives)
     load_dropins
+}
+
+# main
+#   Runs every login hook and pending setup step, logging to the state
+#   directory, or lists the registered steps with --list-steps.
+#   Arguments: $1 optional --list-steps
+#   Returns: 0 always; failed steps are retried at the next login
+main() {
+    if [[ "${1:-}" == --list-steps ]]; then
+        register_steps >/dev/null 2>&1
+        local entry
+        for entry in "${STEPS[@]}" "${LATE_STEPS[@]}"; do
+            echo "${entry%% *}"
+        done
+        return 0
+    fi
+
+    mkdir -p "${STATE_DIR}"
+    exec >>"${LOG_FILE}" 2>&1
+    register_steps
 
     local failed=0 hook
     for hook in "${LOGIN_HOOKS[@]}"; do

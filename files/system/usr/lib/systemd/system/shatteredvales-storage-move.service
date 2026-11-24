@@ -1,0 +1,24 @@
+# Moves apps, home folders or container storage onto a drive chosen with
+# `sv-storage setup`. Runs at start-up, before the login screen, user
+# sessions and container services, so nothing uses the folders while they
+# are copied. Does nothing unless a move is waiting.
+[Unit]
+Description=Move folders onto drives set up with sv-storage
+Documentation=man:fstab(5)
+DefaultDependencies=no
+ConditionPathExists=/etc/shatteredvales/storage-moves
+Requires=local-fs.target
+After=local-fs.target systemd-udev-trigger.service plymouth-start.service
+Before=display-manager.service systemd-user-sessions.service docker.service podman.service flatpak-system-helper.service shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sv-storage run-moves
+# Copying a large home or app folder can take a long time; it must never be
+# killed half way.
+TimeoutStartSec=infinity
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target

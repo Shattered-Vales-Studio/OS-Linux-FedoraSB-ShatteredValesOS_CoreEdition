@@ -63,12 +63,30 @@ install_hook() {
     echo "Enabled the boot menu theme in ${CUSTOM}"
 }
 
-# main
-#   Installs the theme when this machine boots through GRUB in /boot.
+# boot_is_read_only
+#   Tells whether /boot is its own mount and mounted read-only, as bootc and
+#   ostree systems mount it so nothing changes the boot files by accident.
 #   Arguments: none
-#   Returns: 0 unless copying fails
+#   Returns: 0 when /boot is a read-only mount, 1 otherwise
+boot_is_read_only() {
+    findmnt -n -o OPTIONS --mountpoint /boot 2>/dev/null | tr ',' '\n' | grep -qx ro
+}
+
+# main
+#   Installs the theme when this machine boots through GRUB in /boot. A
+#   read-only /boot is made writable only inside a private mount namespace
+#   (the way ostree itself writes boot entries), so the rest of the system
+#   keeps seeing it read-only and the change ends with this script.
+#   Arguments: none
+#   Returns: 0 unless remounting or copying fails
 main() {
     [[ -d "${GRUB}" && -d "${SOURCE}" ]] || exit 0
+    if boot_is_read_only; then
+        if [[ -z "${SV_GRUB_THEME_PRIVATE:-}" ]]; then
+            exec env SV_GRUB_THEME_PRIVATE=1 unshare --mount --propagation private -- "$0" "$@"
+        fi
+        mount -o remount,rw /boot
+    fi
     install_files
     install_hook
 }

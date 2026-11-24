@@ -117,6 +117,15 @@ ghcr.io/blue-build/base-images/fedora-silverblue(-nvidia-open)
   directly: every edition builds on Core's `:latest`.
 - System-wide defaults that people may override go in `/etc` config files
   (dconf `local.d`, browser policies, `mimeapps.list`), never into home folders.
+- `sv-storage` must never offer, change or format a drive holding a
+  system path (/, /boot, /boot/efi, /sysroot, /usr, /etc, /var, swap) or
+  anything mounted it did not mean to unmount, and every check runs again
+  in the privileged step. Its fstab entries use the UUID with `nofail` and
+  `x-systemd.device-timeout=10s`, so a missing drive never blocks start-up.
+  Apps, home folders and containers move only at boot, through
+  `shatteredvales-storage-move.service`, before anyone can sign in, and
+  the old copy is kept until `sv-storage cleanup`. New-drive alerts cover
+  internal drives only. Run `tests/sv-storage.sh` after changing it.
 - The repository is public: anyone may build and use these images.
 
 ## Code standards (organization policy)

@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Name=Set Up Drives
+GenericName=Set up extra drives
+Comment=Use an extra drive for storage, apps or home folders, step by step
+Exec=ptyxis -- sv-storage setup --wait
+Icon=shatteredvales-storage
+Terminal=false
+Categories=System;
+Keywords=drive;disk;hard drive;ssd;nvme;storage;mount;format;partition;
+Actions=list;cleanup;
+
+[Desktop Action list]
+Name=Show All Drives
+Exec=ptyxis -- sv-storage list --wait
+
+[Desktop Action cleanup]
+Name=Free Space From Old Copies
+Exec=ptyxis -- sv-storage cleanup --wait

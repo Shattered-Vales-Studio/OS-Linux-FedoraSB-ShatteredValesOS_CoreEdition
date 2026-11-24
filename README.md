@@ -52,6 +52,41 @@ Update** in the dock checks now and offers to restart; right-click it to
 see what is waiting or to **go back to the previous version** if anything
 misbehaves.
 
+## Drives
+
+- **Set Up Drives** (in the app grid) walks through using an extra
+  internal drive: as a **storage** folder for big files (it appears in the
+  Files sidebar), or as the new home of **apps**, everyone's **home
+  folders** or **containers**. It shows the drive's model, size and type,
+  explains each choice and asks you to type the drive's name before
+  erasing anything. Apps, home folders and containers move at the next
+  restart, before anyone signs in; the old copy is kept until you run
+  `sv-storage cleanup`.
+- **Format USB Drive** erases a USB stick or memory card for Windows, Mac,
+  TVs and cameras (exFAT), old devices (FAT32), Windows (NTFS) or Linux
+  (ext4). It also fixes sticks that were used for an installer with
+  balenaEtcher.
+- The drive holding the system is never offered, and extra drives are set
+  up so the computer still starts when one is missing.
+- Administrators get a notification when a new **internal** drive is not
+  used yet. USB sticks and external USB, Thunderbolt and eSATA drives
+  never trigger it, even USB hard drives that claim to be fixed disks; set
+  those up by hand if you want them as storage.
+- **Several drives in one computer:** in the installer, tick **only** the
+  NVMe drive the system goes on and choose **Automatic**. After the first
+  start, use **Set Up Drives** for the others.
+
+| Command | Does |
+|---|---|
+| `sv-storage` | Lists every drive and what it is used for |
+| `sv-storage setup [drive]` | Sets up an unused drive |
+| `sv-storage usb [drive]` (or `sv-format-usb`) | Formats a USB stick or card |
+| `sv-storage remove [name]` | Stops using a storage drive (keeps its files) |
+| `sv-storage cleanup` | Frees the space of old copies after a move |
+
+Add `--dry-run` to `setup`, `usb` or `remove` to see exactly what would be
+done without changing anything.
+
 ## Installing
 
 ### On a new computer
@@ -108,6 +143,7 @@ edition's own `:testing` before that edition's promotion.
 | `sv-doctor` | Health check for whoever helps; `sv-doctor --copy` copies the report |
 | `sv-gpu-image status` | Shows whether the right image for the graphics card is installed |
 | `sv-first-login` | Re-runs per-person setup |
+| `sv-storage` | Lists drives; see [Drives](#drives) |
 | `rpm-ostree rollback` | Boots the previous version |
 
 ## Keeping up with Fedora

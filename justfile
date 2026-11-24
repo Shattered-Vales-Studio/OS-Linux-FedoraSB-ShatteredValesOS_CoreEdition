@@ -48,3 +48,7 @@ lint:
 keys:
     cosign generate-key-pair
     @echo "Commit cosign.pub. Store cosign.key as the SIGNING_SECRET repo secret, then delete it locally."
+
+# Test sv-storage's drive decisions against saved fixtures (Linux only).
+test-storage:
+    ./tests/sv-storage.sh

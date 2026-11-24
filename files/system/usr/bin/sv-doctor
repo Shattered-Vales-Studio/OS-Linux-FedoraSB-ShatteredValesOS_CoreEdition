@@ -5,8 +5,9 @@
 # Purpose:
 #   One-command health check for whoever helps look after the computer.
 #   Reports the OS image and channel, pending updates, GPU/image match, disk
-#   space, remote help (Tailscale), first-boot app installs and the
-#   per-person setup steps, each as PASS, WARN or FAIL with a suggested fix.
+#   space, extra drives, remote help (Tailscale), first-boot app installs
+#   and the per-person setup steps, each as PASS, WARN or FAIL with a
+#   suggested fix.
 #   Editions add their own checks with drop-in files in
 #   /usr/libexec/shatteredvales/sv-doctor.d/ (sourced in name order) that
 #   define check functions and register them with EDITION_CHECKS+=(fn).
@@ -69,7 +70,7 @@ deployment_field() {
 #   Arguments: none
 #   Returns: 0 always
 check_image() {
-    local ref staged built age
+    local ref image staged built age
     ref="$(deployment_field booted container-image-reference)"
     if [[ -z "${ref}" ]]; then
         report FAIL "OS image" "Not running from a container image (rpm-ostree status failed)"
@@ -78,7 +79,13 @@ check_image() {
     report INFO "OS image" "${ref#*docker://} ($(deployment_field booted version))"
     case "${ref}" in
         ostree-image-signed:*) report PASS "Signature" "Updates are signature-verified" ;;
-        *) report WARN "Signature" "Unverified image; rebase to ostree-image-signed:docker://${ref#*docker://} (see README)" ;;
+        *)
+            # The reference carries a transport prefix (for example
+            # ostree-unverified-registry: or ostree-remote-image:...:docker://)
+            # that the suggested command must not repeat.
+            image="${ref#*docker://}"
+            image="${image#ostree-unverified-registry:}"
+            report WARN "Signature" "Unverified image; run: sudo bootc switch --enforce-container-sigpolicy ${image}" ;;
     esac
 
     staged="$(deployment_field staged checksum)"
@@ -136,6 +143,39 @@ check_disk() {
     done
 }
 
+# check_drives
+#   Confirms every extra drive in /etc/fstab marked nofail is mounted. Such
+#   drives are allowed to be missing at start-up so the computer always
+#   starts, which also means a disconnected or failing drive goes unnoticed
+#   until someone looks for their files. Also reports drive moves that are
+#   waiting for a restart or could not be finished.
+#   Arguments: none
+#   Returns: 0 always
+check_drives() {
+    local src mp type opts mounted=0
+    local -a missing=()
+    while read -r src mp type opts _; do
+        [[ -z "${src}" || "${src}" == \#* ]] && continue
+        [[ ",${opts}," == *,nofail,* && "${type}" != swap && "${mp}" == /* ]] || continue
+        mp="$(printf '%b' "${mp}")"
+        if findmnt -n --mountpoint "${mp}" >/dev/null 2>&1; then
+            mounted=$((mounted + 1))
+        else
+            missing+=("${mp}")
+        fi
+    done < /etc/fstab
+    if (( ${#missing[@]} )); then
+        report WARN "Drives" "Not connected or not mounted: ${missing[*]}; run sv-storage list"
+    elif (( mounted )); then
+        report PASS "Drives" "All ${mounted} extra drives are mounted"
+    fi
+    if [[ -s /etc/shatteredvales/storage-moves.failed ]]; then
+        report WARN "Drive move" "A move did not finish (nothing was lost); see /var/log/shatteredvales-storage.log"
+    elif [[ -s /etc/shatteredvales/storage-moves ]]; then
+        report INFO "Drive move" "Waiting for a restart to move folders onto a new drive"
+    fi
+}
+
 # check_tailscale
 #   Reports whether remote help (Tailscale) is set up. Not being signed in
 #   is normal: Tailscale stays idle until someone chooses to set it up.
@@ -175,13 +215,18 @@ check_flatpaks() {
 }
 
 # check_first_login
-#   Compares completed per-user setup steps with those first-login.sh runs.
+#   Compares completed per-user setup steps with every step first-login.sh
+#   registers, including the edition's drop-in steps.
 #   Arguments: none
 #   Returns: 0 always
 check_first_login() {
     local -a steps pending=()
     local step
-    mapfile -t steps < <(grep -oE 'run_step [a-z0-9-]+' "${FIRST_LOGIN}" | awk '{print $2}')
+    mapfile -t steps < <("${FIRST_LOGIN}" --list-steps)
+    if (( ${#steps[@]} == 0 )); then
+        report WARN "User setup" "Could not list the first-login steps (${FIRST_LOGIN} --list-steps)"
+        return
+    fi
     for step in "${steps[@]}"; do
         [[ -f "${STATE_DIR}/${step}.done" ]] || pending+=("${step}")
     done
@@ -203,6 +248,7 @@ run_checks() {
     check_image
     check_gpu
     check_disk
+    check_drives
     check_tailscale
     for check in "${EDITION_CHECKS[@]}"; do
         "${check}"

@@ -1,0 +1,1904 @@
+#!/usr/bin/env bash
+#
+# sv-storage
+#
+# Purpose:
+#   Guided set-up of extra drives in plain language, so nobody needs to know
+#   partitioning, mkfs or fstab. Lists every drive with its role, sets up an
+#   internal drive as a storage folder or as the new home of apps, home
+#   folders or containers, formats USB sticks (including sticks written by
+#   image writers such as balenaEtcher), and tidies up afterwards.
+#
+#   Safety rules, enforced again in the privileged part of every command:
+#   - drives holding /, /boot, /boot/efi, /sysroot, /usr, /etc, /var or swap
+#     are never offered, changed or formatted;
+#   - a drive with anything mounted is never offered for set-up; USB sticks
+#     are unmounted through udisks first and the format stops if that fails;
+#   - loop, zram and CD/DVD devices are ignored;
+#   - every destructive step shows the drive's model, size, type and what
+#     will be erased, and needs the drive's short name or "erase" typed
+#     (--yes skips this, for scripted use only);
+#   - fstab entries use the filesystem UUID with nofail and a 10 second
+#     device timeout, so a missing drive never stops the computer starting;
+#   - apps, home folders and containers are moved at the next start, before
+#     anyone can sign in, by shatteredvales-storage-move.service, never while
+#     they are in use.
+#
+# Usage:
+#   sv-storage [list]                 Every drive and what it is used for.
+#   sv-storage setup [DEVICE]         Set up an unused drive.
+#       --role storage|apps|homes|containers|docker
+#       --name NAME  --fs ext4|xfs|btrfs|exfat|ntfs  --erase|--keep
+#   sv-storage usb [DEVICE]           Format a USB stick or card.
+#       --fs exfat|fat32|ntfs|ext4  --name NAME  --no-mount
+#   sv-storage remove [NAME|DEVICE]   Stop using a storage drive (keeps data).
+#   sv-storage cleanup                Delete old copies left by moves.
+#   sv-storage check                  Quietly list new internal drives.
+#   sv-storage run-moves              Start-up only (run by
+#                                     shatteredvales-storage-move.service).
+#   Common options:
+#       --dry-run   Show exactly what would run; change nothing.
+#       --yes       Skip questions and confirmation (scripted use only).
+#       --wait      Keep the window open at the end (used by launchers).
+#   Changes ask for an administrator password (pkexec, or sudo without a
+#   desktop).
+#
+# Environment (tests only; any change command refuses to run with these):
+#   SV_STORAGE_LSBLK_JSON    file holding `lsblk -J` output to use instead
+#   SV_STORAGE_SYSTEM_DISKS  space-separated system disk paths for fixtures
+#   SV_STORAGE_SYSFS         folder standing in for /sys
+#   SV_STORAGE_FSTAB         fstab to read instead of /etc/fstab
+#
+# Exit codes:
+#   0 on success, 1 on failure, 3 when cancelled, 10 when `check` finds
+#   unassigned internal drives, 64 on bad usage.
+
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+readonly SELF
+readonly FSTAB="${SV_STORAGE_FSTAB:-/etc/fstab}"
+readonly MOVES_FILE=/etc/shatteredvales/storage-moves
+readonly MOVES_FAILED=/etc/shatteredvales/storage-moves.failed
+readonly LOG_FILE=/var/log/shatteredvales-storage.log
+readonly OLD_DIR=/var/.sv-storage-old
+readonly MNT_BASE=/var/mnt
+readonly MOVE_SERVICE=shatteredvales-storage-move.service
+readonly SYSFS="${SV_STORAGE_SYSFS:-/sys}"
+readonly FSTAB_MARK="# sv-storage:"
+readonly LINUX_GUID=0FC63DAF-8483-4772-8E79-3D69D8477DE4
+readonly BASIC_DATA_GUID=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
+readonly LSBLK_COLUMNS=NAME,PATH,TYPE,SIZE,MODEL,VENDOR,SERIAL,PTUUID,TRAN,ROTA,RM,HOTPLUG,RO,FSTYPE,LABEL,UUID,MOUNTPOINTS,PKNAME
+# Mount points that make a drive part of the running system.
+readonly SYSTEM_MOUNT_RE='^(/|/boot|/boot/efi|/efi|/sysroot|/sysroot/.*|/usr|/etc|/var|/ostree|/ostree/.*|\[SWAP\])$'
+# Filesystem types that belong to encryption, RAID or volume managers: the
+# drive is in use even when nothing on it is mounted.
+readonly MEMBER_FS_RE='^(LVM2_member|linux_raid_member|crypto_LUKS|zfs_member|BitLocker|ddf_raid_member|isw_raid_member|bcache)$'
+
+DRY_RUN=0
+ASSUME_YES=0
+CONFIRMED=0
+WAIT=0
+DRIVES=""
+SYSTEM_DISKS=""
+
+# ---------------------------------------------------------------- output
+
+# say
+#   Prints a highlighted heading.
+#   Arguments: message words
+#   Returns: 0 always
+say() {
+    if [[ -t 1 ]]; then
+        printf '\n\033[1;33m==>\033[0m \033[1m%s\033[0m\n' "$*"
+    else
+        printf '\n==> %s\n' "$*"
+    fi
+}
+
+# warn
+#   Prints a warning in red so it stands out from ordinary text.
+#   Arguments: message words
+#   Returns: 0 always
+warn() {
+    if [[ -t 1 ]]; then
+        printf '\033[1;31m%s\033[0m\n' "$*"
+    else
+        printf '%s\n' "$*"
+    fi
+}
+
+# die
+#   Prints an error to stderr and exits.
+#   Arguments: $1 message, $2 optional exit code (default 1)
+#   Returns: does not return
+die() {
+    printf 'sv-storage: %s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+# log_event
+#   Records a change in the journal and in the storage log, so a helper can
+#   later see what was done to the drives and when.
+#   Arguments: message words
+#   Returns: 0 always
+log_event() {
+    (( DRY_RUN )) && return 0
+    logger -t sv-storage -- "$*" 2>/dev/null || true
+    if (( EUID == 0 )); then
+        printf '%s %s\n' "$(date -Is)" "$*" >> "${LOG_FILE}" 2>/dev/null || true
+    fi
+}
+
+# run
+#   Runs a command, or in dry-run mode prints it exactly as it would run.
+#   Arguments: the command and its arguments
+#   Returns: the command's status (0 in dry-run mode)
+run() {
+    if (( DRY_RUN )); then
+        printf '  would run:'
+        printf ' %q' "$@"
+        printf '\n'
+        return 0
+    fi
+    log_event "run: $*"
+    "$@"
+}
+
+# human_size
+#   Formats a byte count the way drive boxes do (decimal units).
+#   Arguments: $1 size in bytes
+#   Output: for example "2.0 TB" or "64 GB" on stdout
+#   Returns: 0 always
+human_size() {
+    awk -v b="$1" 'BEGIN {
+        split("bytes KB MB GB TB PB", u, " "); i = 1
+        while (b >= 1000 && i < 6) { b /= 1000; i++ }
+        if (i == 1 || b >= 10) printf "%d %s\n", b + 0.5, u[i]
+        else printf "%.1f %s\n", b, u[i]
+    }'
+}
+
+# ask
+#   Asks a question on the terminal.
+#   Arguments: $1 prompt, $2 default answer
+#   Output: the answer (or the default when left empty) on stdout
+#   Returns: 0, or exits 64 when there is no terminal to ask on
+ask() {
+    local reply
+    [[ -t 0 ]] || die "no terminal to ask questions on; give every option and --yes" 64
+    read -r -p "$1" reply </dev/tty
+    printf '%s\n' "${reply:-$2}"
+}
+
+# choose
+#   Shows a numbered menu and returns the chosen entry's key.
+#   Arguments: $1 question, $2 default key, then "key|description" entries
+#   Output: the chosen key on stdout
+#   Returns: 0 on a valid choice; asks again otherwise
+choose() {
+    local question="$1" default="$2" entry reply i
+    shift 2
+    local -a keys=()
+    while true; do
+        printf '\n%s\n' "${question}" >&2
+        i=0
+        keys=()
+        for entry in "$@"; do
+            i=$((i + 1))
+            keys+=("${entry%%|*}")
+            if [[ "${entry%%|*}" == "${default}" ]]; then
+                printf '  %d) %s (recommended)\n' "${i}" "${entry#*|}" >&2
+            else
+                printf '  %d) %s\n' "${i}" "${entry#*|}" >&2
+            fi
+        done
+        reply="$(ask "Choose 1-${i} [default: the recommended one]: " "")"
+        if [[ -z "${reply}" && -n "${default}" ]]; then
+            printf '%s\n' "${default}"
+            return 0
+        fi
+        if [[ "${reply}" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= i )); then
+            printf '%s\n' "${keys[reply - 1]}"
+            return 0
+        fi
+        echo "Please type a number from the list." >&2
+    done
+}
+
+# ---------------------------------------------------------------- drives
+
+# fixture_mode
+#   Tells whether drive data comes from a test fixture instead of the
+#   computer, in which case nothing may be changed.
+#   Arguments: none
+#   Returns: 0 in fixture mode, 1 otherwise
+fixture_mode() {
+    [[ -n "${SV_STORAGE_LSBLK_JSON:-}" ]]
+}
+
+# detect_system_disks
+#   Finds every whole disk that holds a system path or swap, following
+#   partitions through LVM, RAID and encryption to the physical disks.
+#   Arguments: none
+#   Output: the disk paths, one per line
+#   Returns: 0 always
+detect_system_disks() {
+    local mp src
+    if fixture_mode; then
+        tr ' ' '\n' <<<"${SV_STORAGE_SYSTEM_DISKS:-}" | sed '/^$/d'
+        return 0
+    fi
+    {
+        for mp in / /boot /boot/efi /efi /sysroot /usr /etc /var; do
+            findmnt -n -o SOURCE --mountpoint "${mp}" 2>/dev/null || true
+        done
+        swapon --show=NAME --noheadings 2>/dev/null || true
+    } | sed 's/\[.*\]$//' | grep '^/dev/' | sort -u | while read -r src; do
+        # -s walks from the device down to the disks it sits on.
+        lsblk -nspo PATH,TYPE "${src}" 2>/dev/null | awk '$2 == "disk" {print $1}'
+    done | sort -u
+}
+
+# load_drives
+#   Reads every drive once into DRIVES as normalised JSON (one object per
+#   whole disk, with the mount points, filesystems and UUIDs of everything
+#   on it) and finds the system disks.
+#   Arguments: none
+#   Returns: 0 on success, exits 1 when lsblk fails
+load_drives() {
+    local raw
+    if fixture_mode; then
+        raw="$(cat "${SV_STORAGE_LSBLK_JSON}")"
+    else
+        raw="$(lsblk -J -b -o "${LSBLK_COLUMNS}")" || die "could not read the drive list (lsblk failed)"
+    fi
+    DRIVES="$(jq -c '
+        def flag: (. == true or . == 1 or . == "1");
+        def trim: (. // "") | tostring | gsub("^\\s+|\\s+$"; "");
+        [ .blockdevices[] | select(.type == "disk") | {
+            path, name,
+            size: ((.size // 0) | tonumber),
+            model: (.model | trim), vendor: (.vendor | trim),
+            serial: (.serial | trim), ptuuid: (.ptuuid | trim),
+            tran: (.tran | trim), rota: (.rota | flag), rm: (.rm | flag),
+            hotplug: (.hotplug | flag), ro: (.ro | flag),
+            mounts: ([.. | objects | (.mountpoints // [.mountpoint]) | .[]? | select(. != null)] | unique),
+            fstypes: ([.. | objects | .fstype | select(. != null)] | unique),
+            uuids: ([.. | objects | .uuid | select(. != null)] | unique),
+            parts: [ .children[]? | {path, size: ((.size // 0) | tonumber), fstype: (.fstype // ""),
+                     label: (.label // ""), uuid: (.uuid // ""),
+                     mounts: ([(.mountpoints // [.mountpoint])[]? | select(. != null)])} ]
+        } ]' <<<"${raw}")"
+    SYSTEM_DISKS="$(detect_system_disks)"
+}
+
+# drive_get
+#   Reads one value about a drive from DRIVES.
+#   Arguments: $1 drive path, $2 jq expression applied to the drive object
+#   Output: the raw value on stdout (empty when the drive is unknown)
+#   Returns: 0 always
+drive_get() {
+    jq -r --arg p "$1" ".[] | select(.path == \$p) | $2" <<<"${DRIVES}"
+}
+
+# drive_paths
+#   Lists the paths of all whole drives worth showing: no loop, zram or
+#   optical devices and nothing of size zero (empty card readers).
+#   Arguments: none
+#   Output: one path per line
+#   Returns: 0 always
+drive_paths() {
+    jq -r '.[] | select(.size > 0) | select(.name | test("^(loop|zram|sr|ram)") | not) | .path' <<<"${DRIVES}"
+}
+
+# resolve_device
+#   Turns what the person typed (sdb, /dev/sdb, a partition, or a by-id
+#   link) into the whole drive's path.
+#   Arguments: $1 device as typed
+#   Output: the drive path on stdout
+#   Returns: 0 when the drive is known, 1 otherwise
+resolve_device() {
+    local dev="$1" real parent
+    [[ "${dev}" == /dev/* ]] || dev="/dev/${dev}"
+    real="$(readlink -f "${dev}" 2>/dev/null || echo "${dev}")"
+    if [[ -n "$(drive_get "${real}" .path)" ]]; then
+        echo "${real}"
+        return 0
+    fi
+    parent="$(jq -r --arg p "${real}" '.[] | select(any(.parts[]; .path == $p)) | .path' <<<"${DRIVES}")"
+    [[ -n "${parent}" ]] || return 1
+    echo "${parent}"
+}
+
+# is_system_drive
+#   Tells whether a drive holds any part of the running system.
+#   Arguments: $1 drive path
+#   Returns: 0 for a system drive, 1 otherwise
+is_system_drive() {
+    grep -qxF "$1" <<<"${SYSTEM_DISKS}" && return 0
+    # Here-strings rather than pipes into grep -q: with pipefail, grep
+    # exiting early can fail the pipeline and hide a system mount.
+    grep -E "${SYSTEM_MOUNT_RE}" <<<"$(drive_get "$1" '.mounts[]')" >/dev/null
+}
+
+# on_usb_bus
+#   Tells whether the kernel sees a drive behind a USB controller. Catches
+#   USB hard drives and enclosures that report themselves as fixed, SATA
+#   drives (TRAN sata, RM 0).
+#   Arguments: $1 drive path
+#   Returns: 0 when the drive is on USB, 1 otherwise
+on_usb_bus() {
+    local link
+    link="$(readlink -f "${SYSFS}/block/$(basename "$1")" 2>/dev/null)" || return 1
+    [[ "${link}" == */usb* ]]
+}
+
+# is_portable
+#   Tells whether a drive is a USB, FireWire or removable drive, the kind
+#   that is carried between computers.
+#   Arguments: $1 drive path
+#   Returns: 0 for portable drives, 1 otherwise
+is_portable() {
+    local tran rm
+    tran="$(drive_get "$1" .tran)"
+    rm="$(drive_get "$1" .rm)"
+    [[ "${tran}" == usb || "${tran}" == ieee1394 || "${rm}" == true ]] && return 0
+    on_usb_bus "$1"
+}
+
+# is_external
+#   Tells whether a drive is plugged in from outside: portable drives plus
+#   anything the kernel marks as hot-pluggable (eSATA, Thunderbolt and
+#   hot-swap bays). New-drive alerts only cover drives that are not.
+#   Arguments: $1 drive path
+#   Returns: 0 for external drives, 1 otherwise
+is_external() {
+    is_portable "$1" && return 0
+    [[ "$(drive_get "$1" .hotplug)" == true ]]
+}
+
+# drive_kind
+#   Describes a drive's type in words.
+#   Arguments: $1 drive path
+#   Output: for example "NVMe SSD", "hard drive" or "USB stick" on stdout
+#   Returns: 0 always
+drive_kind() {
+    local tran rota rm kind
+    tran="$(drive_get "$1" .tran)"
+    rota="$(drive_get "$1" .rota)"
+    rm="$(drive_get "$1" .rm)"
+    if [[ "${tran}" == nvme ]]; then
+        kind="NVMe SSD"
+    elif [[ "${rota}" == true ]]; then
+        kind="hard drive"
+    else
+        kind="SSD"
+    fi
+    if [[ "${tran}" == usb ]] || on_usb_bus "$1"; then
+        # USB sticks and card readers often claim to be spinning disks.
+        if [[ "${rm}" == true ]]; then kind="USB stick or card"; else kind="USB ${kind}"; fi
+    elif [[ "${rm}" == true ]]; then
+        kind="removable ${kind}"
+    elif [[ "$(drive_get "$1" .hotplug)" == true ]]; then
+        kind="external ${kind}"
+    fi
+    echo "${kind}"
+}
+
+# drive_title
+#   Describes a drive in one line: model, type and size.
+#   Arguments: $1 drive path
+#   Output: for example "Samsung SSD 870 (SSD, 2.0 TB)" on stdout
+#   Returns: 0 always
+drive_title() {
+    local model vendor size
+    model="$(drive_get "$1" .model)"
+    vendor="$(drive_get "$1" .vendor)"
+    size="$(drive_get "$1" .size)"
+    # Virtual and some bridge chips report a bare PCI vendor number.
+    [[ "${vendor}" =~ ^0x[0-9a-fA-F]+$ ]] && vendor=""
+    if [[ -z "${model}" ]]; then
+        model="${vendor:-Unnamed drive}"
+    elif [[ -n "${vendor}" && "${model}" != "${vendor}"* && "${vendor}" != ATA ]]; then
+        model="${vendor} ${model}"
+    fi
+    printf '%s (%s, %s)\n' "${model}" "$(drive_kind "$1")" "$(human_size "${size}")"
+}
+
+# drive_id
+#   A stable identity for a drive, used to remember drives someone chose
+#   not to be asked about again.
+#   Arguments: $1 drive path
+#   Output: the serial number, else the partition-table UUID, else
+#           model and size, on stdout
+#   Returns: 0 always
+drive_id() {
+    local id
+    id="$(drive_get "$1" .serial)"
+    [[ -n "${id}" ]] || id="$(drive_get "$1" .ptuuid)"
+    [[ -n "${id}" ]] || id="$(drive_get "$1" '"\(.model)-\(.size)"' | tr ' ' '_')"
+    echo "${id}"
+}
+
+# fstab_unescape
+#   Decodes the octal escapes fstab uses for spaces and tabs.
+#   Arguments: $1 fstab field
+#   Output: the decoded text on stdout
+#   Returns: 0 always
+fstab_unescape() {
+    printf '%b\n' "$1"
+}
+
+# fstab_mounts_for_uuids
+#   Finds the fstab mount points of the given filesystem UUIDs.
+#   Arguments: UUIDs
+#   Output: one mount point per line
+#   Returns: 0 always
+fstab_mounts_for_uuids() {
+    local uuid src mp rest
+    [[ -r "${FSTAB}" ]] || return 0
+    for uuid in "$@"; do
+        while read -r src mp rest; do
+            [[ "${src}" == "UUID=${uuid}" || "${src}" == "/dev/disk/by-uuid/${uuid}" ]] || continue
+            fstab_unescape "${mp}"
+        done < <(grep -vE '^\s*(#|$)' "${FSTAB}")
+    done
+}
+
+# pending_move_for
+#   Finds a move waiting for the next start that uses one of a drive's
+#   filesystems.
+#   Arguments: $1 drive path
+#   Output: the role of the waiting move, if any
+#   Returns: 0 always
+pending_move_for() {
+    local role uuid target
+    [[ -r "${MOVES_FILE}" ]] || return 0
+    while read -r role uuid target; do
+        if grep -xF "${uuid}" <<<"$(drive_get "$1" '.uuids[]')" >/dev/null; then
+            echo "${role}"
+        fi
+    done < "${MOVES_FILE}"
+    return 0
+}
+
+# role_target
+#   Maps a role to the folder it moves onto its own drive.
+#   Arguments: $1 role
+#   Output: the folder on stdout (empty for storage)
+#   Returns: 0 for a known role, 1 otherwise
+role_target() {
+    case "$1" in
+        apps)       echo /var/lib/flatpak ;;
+        homes)      echo /var/home ;;
+        containers) echo /var/lib/containers ;;
+        docker)     echo /var/lib/docker ;;
+        storage)    echo "" ;;
+        *)          return 1 ;;
+    esac
+}
+
+# role_words
+#   Describes a role in words.
+#   Arguments: $1 role
+#   Output: the description on stdout
+#   Returns: 0 always
+role_words() {
+    case "$1" in
+        apps)       echo "apps (Flatpak)" ;;
+        homes)      echo "everyone's home folders" ;;
+        containers) echo "containers (Podman)" ;;
+        docker)     echo "Docker containers" ;;
+        *)          echo "storage" ;;
+    esac
+}
+
+# mount_role
+#   Names the role of a mount point.
+#   Arguments: $1 mount point
+#   Output: the role on stdout, or nothing for other mount points
+#   Returns: 0 always
+mount_role() {
+    case "$1" in
+        /var/lib/flatpak)    echo apps ;;
+        /var/home|/home)     echo homes ;;
+        /var/lib/containers) echo containers ;;
+        /var/lib/docker)     echo docker ;;
+        /var/mnt/*|/mnt/*)   echo storage ;;
+    esac
+}
+
+# classify
+#   Decides what a drive is used for. Order matters: being part of the
+#   system outranks everything else.
+#   Arguments: $1 drive path
+#   Output: "<class>|<plain description>", where class is one of
+#           system, moving, role, mounted, configured, member, portable,
+#           unassigned
+#   Returns: 0 always
+classify() {
+    local dev="$1" mp role mounts fstypes listed="" pending
+    local -a uuids
+    if is_system_drive "${dev}"; then
+        echo "system|System drive"
+        return
+    fi
+    pending="$(pending_move_for "${dev}")"
+    if [[ -n "${pending}" ]]; then
+        echo "moving|Will hold $(role_words "${pending}") after the next restart"
+        return
+    fi
+    mounts="$(drive_get "${dev}" '.mounts[]')"
+    mapfile -t uuids < <(drive_get "${dev}" '.uuids[]')
+    if [[ -n "${mounts}" ]]; then
+        while read -r mp; do
+            role="$(mount_role "${mp}")"
+            # A folder under /mnt only counts as a storage drive when fstab
+            # mounts it there; otherwise someone mounted it by hand.
+            if [[ "${role}" == storage ]] && ! grep -qxF "${mp}" \
+                <<<"$( ((${#uuids[@]})) && fstab_mounts_for_uuids "${uuids[@]}")"; then
+                role=""
+            fi
+            if [[ "${role}" == storage ]]; then
+                echo "role|Mounted at ${mp} (storage)"
+                return
+            elif [[ -n "${role}" ]]; then
+                echo "role|Holds $(role_words "${role}"), mounted at ${mp}"
+                return
+            fi
+        done <<<"${mounts}"
+        if is_portable "${dev}"; then
+            echo "portable|USB drive, open in Files ($(head -n1 <<<"${mounts}"))"
+        else
+            echo "mounted|In use, mounted at $(paste -sd, <<<"${mounts}")"
+        fi
+        return
+    fi
+    if (( ${#uuids[@]} )); then
+        listed="$(fstab_mounts_for_uuids "${uuids[@]}" | sed -n 1p)"
+    fi
+    if [[ -n "${listed}" ]]; then
+        echo "configured|Set up for ${listed}, but not connected or not mounted"
+        return
+    fi
+    fstypes="$(drive_get "${dev}" '.fstypes[]')"
+    if grep -qE "${MEMBER_FS_RE}" <<<"${fstypes}"; then
+        echo "member|Encrypted, RAID or LVM drive; manage it in Disks"
+        return
+    fi
+    if is_portable "${dev}"; then
+        echo "portable|USB drive"
+        return
+    fi
+    if [[ -n "${fstypes}" ]]; then
+        echo "unassigned|Not set up (has data from before)"
+    else
+        echo "unassigned|Not set up"
+    fi
+}
+
+# drive_class
+#   Prints only the class part of classify.
+#   Arguments: $1 drive path
+#   Output: the class on stdout
+#   Returns: 0 always
+drive_class() {
+    local c
+    c="$(classify "$1")"
+    echo "${c%%|*}"
+}
+
+# show_partitions
+#   Lists what is on a drive now, so the person can see what an erase
+#   would remove.
+#   Arguments: $1 drive path
+#   Returns: 0 always
+show_partitions() {
+    local rows
+    rows="$(drive_get "$1" '.parts[] | "\(.path)\t\(.size)\t\(.fstype)\t\(.label)"')"
+    if [[ -z "${rows}" ]]; then
+        if [[ -n "$(drive_get "$1" '.fstypes[]')" ]]; then
+            echo "    Whole drive: $(drive_get "$1" '.fstypes | join(", ")') data"
+        else
+            echo "    Nothing found on it (empty)"
+        fi
+        return 0
+    fi
+    local path size fstype label
+    while IFS=$'\t' read -r path size fstype label; do
+        printf '    %s  %s  %s%s\n' "${path}" "$(human_size "${size}")" "${fstype:-unknown or empty}" \
+            "${label:+  \"${label}\"}"
+    done <<<"${rows}"
+    if grep -E '^(ntfs|BitLocker)$' <<<"$(drive_get "$1" '.fstypes[]')" >/dev/null; then
+        warn "    This drive looks like it has Windows or Windows files on it."
+    fi
+}
+
+# ---------------------------------------------------------------- names
+
+# validate_name
+#   Checks a drive name for a filesystem and returns the label to write.
+#   Names become folder names too, so they are kept to letters, digits,
+#   spaces, - and _. FAT stores labels in capitals, so its names are
+#   uppercased rather than refused.
+#   Arguments: $1 filesystem (ext4, xfs, btrfs, exfat, ntfs, vfat/fat32,
+#              or "folder" for a name that is only a folder name), $2 name
+#   Output: the label on stdout, or the reason on stderr
+#   Returns: 0 when valid, 1 otherwise
+validate_name() {
+    local fs="$1" name="$2" max
+    case "${fs}" in
+        vfat|fat32) max=11; name="${name^^}" ;;
+        exfat)      max=15 ;;
+        ext4)       max=16 ;;
+        xfs)        max=12 ;;
+        ntfs)       max=32 ;;
+        btrfs)      max=255 ;;
+        folder)     max=64 ;;
+        *)          echo "Unknown filesystem ${fs}" >&2; return 1 ;;
+    esac
+    if [[ -z "${name}" ]]; then
+        echo "The name cannot be empty." >&2
+        return 1
+    fi
+    if [[ ! "${name}" =~ ^[A-Za-z0-9][A-Za-z0-9\ _-]*$ ]]; then
+        echo "Use only letters, numbers, spaces, - and _, starting with a letter or number." >&2
+        return 1
+    fi
+    if [[ "${name}" == *" " ]]; then
+        echo "The name cannot end with a space." >&2
+        return 1
+    fi
+    if (( ${#name} > max )); then
+        echo "That name is too long: at most ${max} characters for this kind of drive." >&2
+        return 1
+    fi
+    echo "${name}"
+}
+
+# ask_name
+#   Asks for a drive name until a valid one is given.
+#   Arguments: $1 filesystem (see validate_name), $2 default name
+#   Output: the label on stdout
+#   Returns: 0 always
+ask_name() {
+    local name label
+    while true; do
+        name="$(ask "Name for the drive [$2]: " "$2")"
+        if label="$(validate_name "$1" "${name}")"; then
+            echo "${label}"
+            return 0
+        fi
+    done
+}
+
+# ---------------------------------------------------------------- fstab
+
+# fstab_escape
+#   Escapes spaces and tabs for an fstab field.
+#   Arguments: $1 text
+#   Output: the escaped text on stdout
+#   Returns: 0 always
+fstab_escape() {
+    local s="$1"
+    s="${s// /\\040}"
+    printf '%s\n' "${s//$'\t'/\\011}"
+}
+
+# mount_fstype
+#   Maps a filesystem name to the type fstab and mount use.
+#   Arguments: $1 filesystem as blkid names it
+#   Output: the mount type on stdout
+#   Returns: 0 always
+mount_fstype() {
+    case "$1" in
+        # The kernel NTFS driver is faster than ntfs-3g and needs no helper.
+        ntfs) echo ntfs3 ;;
+        fat32|vfat) echo vfat ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# mount_options
+#   Builds the mount options for a filesystem and role.
+#   Arguments: $1 filesystem, $2 role, $3 name shown in Files (storage),
+#              $4 owner uid and $5 group id for filesystems without Linux
+#              permissions
+#   Output: the comma-separated options on stdout
+#   Returns: 0 always
+mount_options() {
+    local fs="$1" role="$2" name="$3" uid="$4" gid="$5" opts
+    opts="defaults,nofail,x-systemd.device-timeout=10s"
+    case "${fs}" in
+        exfat|vfat|fat32|ntfs) opts+=",uid=${uid},gid=${gid},umask=0002" ;;
+    esac
+    if [[ "${role}" == storage ]]; then
+        # gvfs reads x-gvfs-name as a URI-escaped string.
+        opts+=",x-gvfs-show,x-gvfs-name=${name// /%20}"
+    else
+        # nofail mounts are otherwise not ordered before local-fs.target, so
+        # without this sign-in could start before /var/home or the app
+        # folder is mounted. It is ordering only: a missing drive still
+        # times out after 10 seconds and start-up continues.
+        opts+=",x-systemd.before=local-fs.target"
+    fi
+    echo "${opts}"
+}
+
+# render_fstab_entry
+#   Writes the fstab lines for a drive: a marker comment that sv-storage
+#   uses to find its own entries again, then the mount line.
+#   Arguments: $1 UUID, $2 mount point, $3 filesystem, $4 options,
+#              $5 role, $6 name
+#   Output: the two lines on stdout
+#   Returns: 0 always
+render_fstab_entry() {
+    local pass=0
+    # Only ext4 and xfs have a boot-time check worth running; fsck for
+    # btrfs, exFAT, FAT and NTFS does nothing useful at boot.
+    [[ "$3" == ext4 || "$3" == xfs ]] && pass=2
+    printf '%s %s %s\n' "${FSTAB_MARK}" "$5" "$6"
+    printf 'UUID=%s  %s  %s  %s  0  %s\n' "$1" "$(fstab_escape "$2")" "$(mount_fstype "$3")" "$4" "${pass}"
+}
+
+# backup_fstab
+#   Keeps a timestamped copy of fstab before any change.
+#   Arguments: none
+#   Output: the copy's path on stdout
+#   Returns: 0 on success
+backup_fstab() {
+    local copy
+    copy="${FSTAB}.sv-storage-$(date +%Y%m%d-%H%M%S)"
+    cp -a "${FSTAB}" "${copy}"
+    echo "${copy}"
+}
+
+# replace_fstab
+#   Replaces fstab with new content in one step (write a sibling file, then
+#   rename), so a power cut never leaves a half-written fstab.
+#   Arguments: $1 file holding the new content
+#   Returns: 0 on success
+replace_fstab() {
+    local tmp
+    tmp="$(mktemp "$(dirname "${FSTAB}")/.fstab.sv-storage.XXXXXX")"
+    cat "$1" > "${tmp}"
+    chmod 644 "${tmp}"
+    sync -f "${tmp}" 2>/dev/null || true
+    mv -f "${tmp}" "${FSTAB}"
+    restorecon "${FSTAB}" 2>/dev/null || true
+}
+
+# fstab_add
+#   Adds an entry to fstab after checking it parses, keeping a backup.
+#   Arguments: the arguments of render_fstab_entry
+#   Returns: 0 on success, 1 if the entry does not verify
+fstab_add() {
+    local entry work
+    entry="$(render_fstab_entry "$@")"
+    if (( DRY_RUN )); then
+        echo "  would add to ${FSTAB} (after saving a dated backup copy):"
+        printf '    %s\n' "${entry%%$'\n'*}" "${entry#*$'\n'}"
+        return 0
+    fi
+    work="$(mktemp)"
+    printf '%s\n' "${entry}" > "${work}"
+    if ! findmnt --verify --tab-file "${work}" >/dev/null 2>&1; then
+        findmnt --verify --tab-file "${work}" >&2 || true
+        rm -f "${work}"
+        echo "The new fstab entry did not verify; nothing was changed." >&2
+        return 1
+    fi
+    log_event "fstab backup: $(backup_fstab)"
+    { cat "${FSTAB}"; [[ -z "$(tail -c1 "${FSTAB}")" ]] || echo; printf '%s\n' "${entry}"; } > "${work}"
+    replace_fstab "${work}"
+    rm -f "${work}"
+    log_event "fstab: added ${entry//$'\n'/ | }"
+    systemctl daemon-reload
+}
+
+# fstab_remove_uuid
+#   Removes the fstab entry for a UUID together with its marker comment,
+#   keeping a backup.
+#   Arguments: $1 UUID
+#   Returns: 0 on success
+fstab_remove_uuid() {
+    local work
+    if (( DRY_RUN )); then
+        echo "  would remove from ${FSTAB} (after saving a dated backup copy):"
+        grep -B1 -E "^(UUID=$1|/dev/disk/by-uuid/$1)\s" "${FSTAB}" | sed 's/^/    /'
+        return 0
+    fi
+    log_event "fstab backup: $(backup_fstab)"
+    work="$(mktemp)"
+    awk -v u="$1" -v mark="${FSTAB_MARK}" '
+        index($0, mark) == 1 { held = $0; next }
+        $1 == "UUID=" u || $1 == "/dev/disk/by-uuid/" u { held = ""; next }
+        { if (held != "") print held; held = ""; print }
+        END { if (held != "") print held }
+    ' "${FSTAB}" > "${work}"
+    replace_fstab "${work}"
+    rm -f "${work}"
+    log_event "fstab: removed UUID=$1"
+    systemctl daemon-reload
+}
+
+# ---------------------------------------------------------------- privilege
+
+# require_changes_allowed
+#   Stops change commands when drive data comes from a test fixture.
+#   Arguments: none
+#   Returns: 0 when changes may be made; exits 1 otherwise
+require_changes_allowed() {
+    fixture_mode && (( ! DRY_RUN )) && die "test fixture in use; only --dry-run is allowed"
+    return 0
+}
+
+# run_as_admin
+#   Runs sv-storage again with administrator rights for the actual change.
+#   Uses pkexec in a desktop session, which shows the familiar password
+#   dialog, and sudo otherwise.
+#   Arguments: the sv-storage arguments to run with
+#   Returns: the elevated command's exit status
+run_as_admin() {
+    echo
+    echo "Changing drives needs an administrator password."
+    if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]] && command -v pkexec >/dev/null; then
+        pkexec "${SELF}" "$@"
+    else
+        sudo "${SELF}" "$@"
+    fi
+}
+
+# invoking_user
+#   Finds the person who started sv-storage, even through sudo or pkexec.
+#   Arguments: none
+#   Output: the user name on stdout (empty when run directly as root)
+#   Returns: 0 always
+invoking_user() {
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
+        echo "${SUDO_USER}"
+    elif [[ -n "${PKEXEC_UID:-}" ]]; then
+        id -nu "${PKEXEC_UID}" 2>/dev/null || true
+    elif (( EUID != 0 )); then
+        id -un
+    fi
+}
+
+# first_user
+#   Finds the first person's account (the lowest regular UID), the account
+#   the installer created.
+#   Arguments: none
+#   Output: the user name on stdout
+#   Returns: 0 always
+first_user() {
+    getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 {print $3, $1}' | sort -n | head -n1 | cut -d' ' -f2
+}
+
+# ---------------------------------------------------------------- list / check
+
+# cmd_list
+#   Prints every drive in plain words with what it is used for.
+#   Arguments: none
+#   Returns: 0 always
+cmd_list() {
+    local dev c
+    load_drives
+    say "Drives in this computer"
+    while read -r dev; do
+        [[ -n "${dev}" ]] || continue
+        c="$(classify "${dev}")"
+        printf '  %-14s %s\n  %-14s %s\n' "${dev#/dev/}" "$(drive_title "${dev}")" "" "${c#*|}"
+    done < <(drive_paths)
+    if [[ -s "${MOVES_FAILED}" ]]; then
+        echo
+        warn "A move could not be finished; nothing was lost. Details: ${LOG_FILE}"
+    fi
+    if [[ -d "${OLD_DIR}" ]] && [[ -n "$(ls -A "${OLD_DIR}" 2>/dev/null)" ]]; then
+        echo
+        echo "Old copies from earlier moves are kept on the system drive."
+        echo "Once everything works, free their space with: sv-storage cleanup"
+    fi
+}
+
+# cmd_check
+#   Lists internal drives that are not used for anything yet. External,
+#   USB, FireWire, removable and hot-pluggable drives are never reported,
+#   since they come and go and would otherwise prompt at every login.
+#   Arguments: none
+#   Output: "<path>\t<id>\t<description>" per drive
+#   Returns: 0 when there are none, 10 when at least one was found
+cmd_check() {
+    local dev found=0
+    load_drives
+    while read -r dev; do
+        [[ -n "${dev}" ]] || continue
+        [[ "$(drive_class "${dev}")" == unassigned ]] || continue
+        is_external "${dev}" && continue
+        printf '%s\t%s\t%s\n' "${dev}" "$(drive_id "${dev}")" "$(drive_title "${dev}")"
+        found=1
+    done < <(drive_paths)
+    (( found )) && return 10
+    return 0
+}
+
+# ---------------------------------------------------------------- setup
+
+# setup_candidates
+#   Lists drives that can be set up: not part of the system, not in use and
+#   not a removable stick (those are formatted with `sv-storage usb`).
+#   Arguments: none
+#   Output: one drive path per line
+#   Returns: 0 always
+setup_candidates() {
+    local dev
+    while read -r dev; do
+        [[ -n "${dev}" ]] || continue
+        setup_refusal "${dev}" >/dev/null && echo "${dev}"
+    done < <(drive_paths)
+    return 0
+}
+
+# setup_refusal
+#   Explains why a drive cannot be set up.
+#   Arguments: $1 drive path
+#   Output: the reason on stdout, when there is one
+#   Returns: 0 when the drive can be set up, 1 otherwise
+setup_refusal() {
+    local dev="$1" c
+    c="$(classify "${dev}")"
+    case "${c%%|*}" in
+        system)     echo "it holds the system (Shattered Vales OS itself)" ;;
+        moving)     echo "it is already waiting to be used: ${c#*|}" ;;
+        role|mounted) echo "it is already in use: ${c#*|}" ;;
+        configured) echo "it is already set up: ${c#*|} (see: sv-storage remove)" ;;
+        member)     echo "it belongs to an encrypted, RAID or LVM set" ;;
+        portable|unassigned)
+            if [[ "$(drive_get "${dev}" .ro)" == true ]]; then
+                echo "it is read-only"
+            elif [[ "$(drive_get "${dev}" .rm)" == true ]]; then
+                echo "it is a removable stick or card; format it with: sv-storage usb"
+            else
+                return 0
+            fi ;;
+    esac
+    return 1
+}
+
+# pick_drive
+#   Shows the drives that may be chosen and asks which one.
+#   Arguments: $1 question, then drive paths
+#   Output: the chosen path on stdout
+#   Returns: 0 always
+pick_drive() {
+    local question="$1" dev
+    shift
+    local -a entries=()
+    for dev in "$@"; do
+        entries+=("${dev}|${dev#/dev/}: $(drive_title "${dev}"), $(classify "${dev}" | cut -d'|' -f2)")
+    done
+    choose "${question}" "" "${entries[@]}"
+}
+
+# offered_roles
+#   Lists the roles a drive may take. Portable drives only hold a storage
+#   folder: apps, home folders or containers on a drive that may be
+#   unplugged would vanish from under the people using them.
+#   Arguments: $1 drive path
+#   Output: one "role|description" entry per line
+#   Returns: 0 always
+offered_roles() {
+    echo "storage|Storage: a named folder for large files (photos, videos, backups)"
+    is_portable "$1" && return 0
+    local role target
+    for role in apps homes containers docker; do
+        target="$(role_target "${role}")"
+        [[ "${role}" == docker && ! -d "${target}" ]] && continue
+        # Already on its own drive, or a move is already waiting.
+        findmnt -n --mountpoint "${target}" >/dev/null 2>&1 && continue
+        [[ -r "${MOVES_FILE}" ]] && grep -q "^${role} " "${MOVES_FILE}" && continue
+        case "${role}" in
+            apps)       echo "apps|Apps: move all installed apps (Flatpak) onto this drive" ;;
+            homes)      echo "homes|Home folders: move everyone's files and settings onto this drive" ;;
+            containers) echo "containers|Containers: move Podman's container storage onto this drive" ;;
+            docker)     echo "docker|Docker: move Docker's storage onto this drive" ;;
+        esac
+    done
+}
+
+# offered_filesystems
+#   Lists filesystems for a role, with the recommended one first.
+#   Arguments: $1 role
+#   Output: one "fs|description" entry per line
+#   Returns: 0 always
+offered_filesystems() {
+    echo "ext4|ext4: reliable, the standard for Linux"
+    echo "xfs|XFS: good for very large files such as video"
+    echo "btrfs|Btrfs: can take snapshots of the drive"
+    if [[ "$1" == storage ]]; then
+        echo "exfat|exFAT: also readable on Windows and Mac (does not keep Linux permissions)"
+        echo "ntfs|NTFS: for drives that also go to Windows (does not keep Linux permissions)"
+    fi
+}
+
+# keepable_filesystem
+#   Finds the one filesystem on a drive that could be kept and mounted.
+#   Arguments: $1 drive path
+#   Output: "<partition path> <fstype> <uuid> <label>" on stdout, or
+#           nothing when there is not exactly one usable filesystem
+#   Returns: 0 always
+keepable_filesystem() {
+    local rows
+    rows="$(drive_get "$1" '[.parts[] | select(.fstype | test("^(ext4|xfs|btrfs|exfat|vfat|ntfs)$"))]
+        | if length == 1 then .[0] | "\(.path) \(.fstype) \(.uuid) \(.label)" else empty end')"
+    if [[ -z "${rows}" && "$(drive_get "$1" '.parts | length')" == 0 ]]; then
+        rows="$(drive_get "$1" 'select(.fstypes | length == 1) | select(.fstypes[0] | test("^(ext4|xfs|btrfs|exfat|vfat|ntfs)$"))
+            | "\(.path) \(.fstypes[0]) \(.uuids[0] // "") "')"
+    fi
+    echo "${rows}"
+}
+
+# confirm_erase
+#   Shows what an erase will destroy and asks for the drive's short name
+#   or "erase" to be typed.
+#   Arguments: $1 drive path, $2 what the drive will become
+#   Returns: 0 when confirmed; exits 3 when not
+confirm_erase() {
+    local dev="$1" short reply
+    short="${dev#/dev/}"
+    # The person already saw this and confirmed before the password prompt.
+    (( CONFIRMED )) && return 0
+    say "Please check this carefully"
+    echo "  Drive:     ${short}, $(drive_title "${dev}")"
+    echo "  Now on it:"
+    show_partitions "${dev}"
+    echo "  Will be:   $2"
+    echo
+    warn "Everything on this drive will be erased. This cannot be undone."
+    (( ASSUME_YES || DRY_RUN )) && return 0
+    reply="$(ask "Type ${short} or erase to continue, anything else to stop: " "")"
+    if [[ "${reply}" != "${short}" && "${reply,,}" != erase ]]; then
+        echo "Stopped. Nothing was changed."
+        exit 3
+    fi
+}
+
+# confirm_plain
+#   Asks a yes/no question that changes nothing destructive.
+#   Arguments: $1 question
+#   Returns: 0 on yes; exits 3 on no
+confirm_plain() {
+    (( ASSUME_YES || DRY_RUN )) && return 0
+    local reply
+    reply="$(ask "$1 [y/N] " n)"
+    [[ "${reply}" =~ ^[Yy] ]] || { echo "Stopped. Nothing was changed."; exit 3; }
+}
+
+# wait_for_partition
+#   Waits for the kernel and udev to show a drive's first partition.
+#   Arguments: $1 drive path
+#   Output: the partition path on stdout
+#   Returns: 0 when it appears, 1 after 10 seconds
+wait_for_partition() {
+    local part i
+    if (( DRY_RUN )); then
+        if [[ "$1" =~ [0-9]$ ]]; then echo "${1}p1"; else echo "${1}1"; fi
+        return 0
+    fi
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        udevadm settle 2>/dev/null || true
+        part="$(lsblk -nlpo PATH,TYPE "$1" | awk '$2 == "part" {print $1; exit}')"
+        if [[ -n "${part}" && -b "${part}" ]]; then
+            echo "${part}"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# wipe_drive
+#   Removes every filesystem, partition table and RAID signature from a
+#   drive and its partitions.
+#   Arguments: $1 drive path
+#   Returns: 0 on success
+wipe_drive() {
+    local part
+    while read -r part; do
+        [[ -n "${part}" ]] && run wipefs -a "${part}"
+    done < <(drive_get "$1" '.parts[].path')
+    run wipefs -a "$1"
+}
+
+# make_filesystem
+#   Creates a filesystem with a label.
+#   Arguments: $1 partition path, $2 filesystem (ext4, xfs, btrfs, exfat,
+#              ntfs, fat32), $3 label
+#   Returns: mkfs's status
+make_filesystem() {
+    case "$2" in
+        ext4)  run mkfs.ext4 -F -L "$3" "$1" ;;
+        xfs)   run mkfs.xfs -f -L "$3" "$1" ;;
+        btrfs) run mkfs.btrfs -f -L "$3" "$1" ;;
+        exfat) run mkfs.exfat -L "$3" "$1" ;;
+        # Quick format: a full NTFS format zeroes the whole drive for hours.
+        ntfs)  run mkntfs -f -L "$3" "$1" ;;
+        fat32) run mkfs.vfat -F 32 -n "$3" "$1" ;;
+        *)     echo "Unknown filesystem $2" >&2; return 1 ;;
+    esac
+}
+
+# fs_uuid
+#   Reads a filesystem's UUID straight from the device.
+#   Arguments: $1 partition path
+#   Output: the UUID on stdout
+#   Returns: 0 on success, 1 when there is none
+fs_uuid() {
+    if (( DRY_RUN )); then
+        echo "<new-uuid>"
+        return 0
+    fi
+    udevadm settle 2>/dev/null || true
+    blkid -p -s UUID -o value "$1" 2>/dev/null | grep . || blkid -s UUID -o value "$1" | grep .
+}
+
+# set_storage_permissions
+#   Lets every administrator and the first person write to a storage
+#   folder. A POSIX ACL is used rather than a new group: it takes effect at
+#   once (a new group only applies after everyone signs out and in again),
+#   needs no change to the account database, and the default ACL makes
+#   files that one person creates writable by the others regardless of
+#   their umask.
+#   Arguments: $1 folder, $2 first user, $3 1 to apply to existing
+#              contents too, 0 for the folder itself only
+#   Returns: 0 on success
+set_storage_permissions() {
+    local dir="$1" user="$2" recursive="$3" spec defaults
+    spec="g:wheel:rwX${user:+,u:${user}:rwX}"
+    # setfacl applies a d: prefix to one entry only, so each default entry
+    # carries its own.
+    defaults="d:g:wheel:rwX${user:+,d:u:${user}:rwX}"
+    run chgrp wheel "${dir}"
+    run chmod 2775 "${dir}"
+    if (( recursive )); then
+        run setfacl -R -m "${spec}" -m "${defaults}" "${dir}"
+    else
+        run setfacl -m "${spec}" -m "${defaults}" "${dir}"
+    fi
+}
+
+# apply_setup
+#   Carries out a set-up that has been confirmed. Runs as root and checks
+#   the drive's eligibility again, since time may have passed since the
+#   questions were answered.
+#   Arguments: $1 drive, $2 role, $3 name/label, $4 filesystem,
+#              $5 erase|keep, $6 user who asked (may be empty)
+#   Returns: 0 on success, 1 on failure
+apply_setup() {
+    local dev="$1" role="$2" name="$3" fs="$4" mode="$5" asker="$6"
+    local reason part uuid target mp owner uid gid keep
+    if (( EUID != 0 && ! DRY_RUN )); then
+        die "this step must run as an administrator"
+    fi
+    if ! reason="$(setup_refusal "${dev}")"; then
+        die "${dev#/dev/} cannot be set up: ${reason}"
+    fi
+    if [[ "${role}" != storage ]] && is_portable "${dev}"; then
+        die "a USB or removable drive can only be used for storage"
+    fi
+    log_event "setup ${dev} role=${role} name=${name} fs=${fs} mode=${mode} by=${asker:-root}"
+
+    if [[ "${mode}" == keep ]]; then
+        [[ "${role}" == storage ]] || die "keeping existing data is only possible for storage"
+        keep="$(keepable_filesystem "${dev}")"
+        [[ -n "${keep}" ]] || die "there is not exactly one filesystem on ${dev#/dev/} to keep"
+        read -r part fs uuid _ <<<"${keep}"
+        [[ -n "${uuid}" ]] || die "the filesystem on ${part} has no UUID"
+    else
+        say "Preparing the drive"
+        wipe_drive "${dev}"
+        local guid="${LINUX_GUID}"
+        [[ "${fs}" == exfat || "${fs}" == ntfs ]] && guid="${BASIC_DATA_GUID}"
+        if (( DRY_RUN )); then
+            printf '  would run: sfdisk %s, with the table "label: gpt; type=%s"\n' "${dev}" "${guid}"
+        else
+            log_event "run: sfdisk gpt type=${guid} ${dev}"
+            printf 'label: gpt\ntype=%s\n' "${guid}" | sfdisk --quiet --wipe always --wipe-partitions always "${dev}"
+        fi
+        part="$(wait_for_partition "${dev}")" || die "the new partition on ${dev} did not appear"
+        say "Formatting as ${fs}"
+        make_filesystem "${part}" "${fs}" "${name}"
+        uuid="$(fs_uuid "${part}")" || die "could not read the new filesystem's UUID"
+    fi
+
+    owner="${asker}"
+    [[ -n "${owner}" ]] || owner="$(first_user)"
+    uid="$(id -u "${owner}" 2>/dev/null || echo 0)"
+    gid="$(getent group wheel | cut -d: -f3)"
+
+    if [[ "${role}" == storage ]]; then
+        mp="${MNT_BASE}/${name}"
+        if [[ -n "$(fstab_mounts_for_uuids "${uuid}")" ]] || grep -qF " $(fstab_escape "${mp}") " "${FSTAB}" 2>/dev/null; then
+            die "${mp} is already in ${FSTAB}; choose another name"
+        fi
+        if findmnt -n --mountpoint "${mp}" >/dev/null 2>&1 || { [[ -d "${mp}" ]] && [[ -n "$(ls -A "${mp}")" ]]; }; then
+            die "${mp} is already in use; choose another name"
+        fi
+        run mkdir -p "${mp}"
+        fstab_add "${uuid}" "${mp}" "${fs}" "$(mount_options "${fs}" storage "${name}" "${uid}" "${gid}")" storage "${name}"
+        run mount "${mp}"
+        case "${fs}" in
+            ext4|xfs|btrfs)
+                # A kept drive's own files keep their owners; only its top
+                # folder is opened up, so nobody's private files change.
+                if [[ "${mode}" == keep ]]; then
+                    set_storage_permissions "${mp}" "$(first_user)" 0
+                else
+                    set_storage_permissions "${mp}" "$(first_user)" 1
+                fi
+                run restorecon -R "${mp}" ;;
+        esac
+        log_event "setup done: ${dev} mounted at ${mp}"
+        say "Done"
+        echo "The drive is ready at ${mp} and shows as \"${name}\" in the Files sidebar."
+        if is_external "${dev}"; then
+            echo "It is an external drive: the folder appears whenever it is plugged in."
+            echo "When it is unplugged the computer still starts normally."
+        fi
+        return 0
+    fi
+
+    target="$(role_target "${role}")"
+    if (( DRY_RUN )); then
+        echo "  would add to ${MOVES_FILE}: ${role} ${uuid} ${target}"
+        echo "  would run: systemctl enable ${MOVE_SERVICE}"
+    else
+        mkdir -p "$(dirname "${MOVES_FILE}")"
+        printf '%s %s %s\n' "${role}" "${uuid}" "${target}" >> "${MOVES_FILE}"
+        log_event "move queued: ${role} ${uuid} ${target}"
+        systemctl is-enabled --quiet "${MOVE_SERVICE}" 2>/dev/null || systemctl enable "${MOVE_SERVICE}"
+    fi
+    say "Almost done: restart to finish"
+    local words; words="$(role_words "${role}")"
+    echo "${words^} will move onto the new drive the next time the computer"
+    echo "starts, before anyone signs in, so nothing is in use while it moves. Large"
+    echo "amounts of data can make that start take a while; let it finish."
+    echo
+    echo "The old copy stays on the system drive until you are happy everything works."
+    echo "Then free its space with: sv-storage cleanup"
+}
+
+# cmd_setup
+#   Asks what a drive is for and sets it up.
+#   Arguments: setup options (see Usage)
+#   Returns: 0 on success; exits non-zero on failure or cancel
+cmd_setup() {
+    local dev="" role="" name="" fs="" mode="" owner="" reason keep keep_label
+    while (( $# )); do
+        case "$1" in
+            --role) role="${2:?}"; shift ;;
+            --name) name="${2:?}"; shift ;;
+            --fs) fs="${2:?}"; shift ;;
+            --erase) mode=erase ;;
+            --keep) mode=keep ;;
+            --owner) owner="${2:?}"; shift ;;
+            -*) die "unknown option $1" 64 ;;
+            *) dev="$1" ;;
+        esac
+        shift
+    done
+    require_changes_allowed
+    load_drives
+
+    if [[ -z "${dev}" ]]; then
+        (( ASSUME_YES )) && die "--yes needs a drive" 64
+        local -a candidates
+        mapfile -t candidates < <(setup_candidates)
+        if (( ${#candidates[@]} == 0 )); then
+            say "No drive is waiting to be set up"
+            echo "Every drive is part of the system or already in use. To see them all: sv-storage list"
+            echo "To format a USB stick, use Format USB Drive (sv-storage usb)."
+            return 0
+        fi
+        dev="$(pick_drive "Which drive do you want to set up?" "${candidates[@]}")"
+    else
+        dev="$(resolve_device "${dev}")" || die "there is no drive called $1" 1
+    fi
+    if reason="$(setup_refusal "${dev}")"; then :; else
+        die "${dev#/dev/} cannot be set up: ${reason}"
+    fi
+
+    if [[ -z "${role}" ]]; then
+        (( ASSUME_YES )) && die "--yes needs --role" 64
+        local -a roles
+        mapfile -t roles < <(offered_roles "${dev}")
+        if is_portable "${dev}"; then
+            echo
+            echo "This is a USB drive, so it can be used for storage only. Its folder appears"
+            echo "whenever it is plugged in; the computer starts normally without it."
+        fi
+        role="$(choose "What should ${dev#/dev/} be used for?" storage "${roles[@]}")"
+    fi
+    grep "^${role}|" <<<"$(offered_roles "${dev}")" >/dev/null || die "${role} is not possible for ${dev#/dev/}" 64
+
+    keep="$(keepable_filesystem "${dev}")"
+    if [[ -z "${mode}" ]]; then
+        if [[ "${role}" == storage && -n "${keep}" ]]; then
+            (( ASSUME_YES )) && die "--yes needs --keep or --erase" 64
+            mode="$(choose "This drive already has files on it. What should happen to them?" keep \
+                "keep|Keep what's on it and just use it as storage" \
+                "erase|Erase it and start fresh")"
+        else
+            mode=erase
+        fi
+    fi
+    if [[ "${mode}" == keep ]]; then
+        [[ "${role}" == storage && -n "${keep}" ]] || die "there is nothing on ${dev#/dev/} that can be kept for this" 64
+        fs="$(cut -d' ' -f2 <<<"${keep}")"
+        keep_label="$(cut -d' ' -f4- <<<"${keep}")"
+        if [[ -z "${name}" ]]; then
+            (( ASSUME_YES )) && die "--yes needs --name" 64
+            keep_label="$(validate_name folder "${keep_label}" 2>/dev/null || echo Storage)"
+            name="$(ask_name folder "${keep_label}")"
+        fi
+        name="$(validate_name folder "${name}")" || exit 64
+    else
+        if [[ -z "${fs}" ]]; then
+            (( ASSUME_YES )) && die "--yes needs --fs" 64
+            local -a fss
+            mapfile -t fss < <(offered_filesystems "${role}")
+            fs="$(choose "Which kind of filesystem?" ext4 "${fss[@]}")"
+        fi
+        grep "^${fs}|" <<<"$(offered_filesystems "${role}")" >/dev/null || die "${fs} cannot be used for ${role}" 64
+        if [[ "${fs}" == exfat || "${fs}" == ntfs ]]; then
+            warn "Note: ${fs} does not keep Linux owners and permissions; everyone who can"
+            warn "sign in can change everything on the drive."
+        fi
+        if [[ -z "${name}" ]]; then
+            (( ASSUME_YES )) && die "--yes needs --name" 64
+            local default
+            case "${role}" in
+                storage) default=Storage ;;
+                apps) default=Apps ;;
+                homes) default=Homes ;;
+                containers) default=Containers ;;
+                docker) default=Docker ;;
+            esac
+            name="$(ask_name "${fs}" "${default}")"
+        fi
+        name="$(validate_name "${fs}" "${name}")" || exit 64
+    fi
+
+    local becomes
+    if [[ "${role}" == storage ]]; then
+        becomes="storage folder ${MNT_BASE}/${name} (\"${name}\" in Files), ${fs}"
+    else
+        becomes="the new home of $(role_words "${role}") ($(role_target "${role}")), ${fs}, moved at the next restart"
+    fi
+    if [[ "${mode}" == erase ]]; then
+        confirm_erase "${dev}" "${becomes}"
+    elif (( ! CONFIRMED )); then
+        say "Please check"
+        echo "  Drive:  ${dev#/dev/}, $(drive_title "${dev}")"
+        echo "  Will be: ${becomes}; its files are kept"
+        confirm_plain "Continue?"
+    fi
+
+    local -a args=(setup "${dev}" --role "${role}" --name "${name}" --fs "${fs}" "--${mode}" --yes)
+    if (( DRY_RUN )); then
+        say "Dry run: these are the steps; nothing is changed"
+        apply_setup "${dev}" "${role}" "${name}" "${fs}" "${mode}" "${owner:-$(invoking_user)}"
+        return 0
+    fi
+    if (( EUID != 0 )); then
+        run_as_admin "${args[@]}" --owner "$(id -un)" --confirmed
+        return
+    fi
+    apply_setup "${dev}" "${role}" "${name}" "${fs}" "${mode}" "${owner:-$(invoking_user)}"
+}
+
+# ---------------------------------------------------------------- moves
+
+# tree_summary
+#   Counts the entries in a folder and adds up the sizes of its files, to
+#   check that a copy is complete. lost+found is skipped because a fresh
+#   ext4 filesystem has one that the original folder does not.
+#   Arguments: $1 folder
+#   Output: "<entries> <bytes>" on stdout
+#   Returns: 0 always
+tree_summary() {
+    find "$1" -mindepth 1 \( -path "$1/lost+found" -prune \) -o -printf '%y %s\n' \
+        | awk '{n++; if ($1 == "f") s += $2} END {printf "%d %d\n", n, s}'
+}
+
+# plymouth_say
+#   Shows a message on the start-up screen, so a long move does not look
+#   like a hang.
+#   Arguments: message words
+#   Returns: 0 always
+plymouth_say() {
+    plymouth display-message --text="$*" 2>/dev/null || true
+}
+
+# process_move
+#   Moves one folder onto its new drive. The copy is checked against the
+#   original before anything is switched over; on any problem the original
+#   stays exactly where it was and in use.
+#   Arguments: $1 role, $2 filesystem UUID, $3 target folder
+#   Returns: 0 on success, 1 when the move was refused or failed
+process_move() {
+    local role="$1" uuid="$2" target="$3" dev tmp src_sum dst_sum stamp old backup fs
+    log_event "move start: ${role} ${uuid} -> ${target}"
+    dev="/dev/disk/by-uuid/${uuid}"
+    local i
+    # Early in start-up a slow drive may not have been announced yet.
+    for (( i = 0; i < 30; i++ )); do
+        [[ -e "${dev}" ]] && break
+        udevadm settle --timeout=5 2>/dev/null || true
+        sleep 1
+    done
+    [[ -e "${dev}" ]] || { log_event "move refused: drive ${uuid} not found"; return 1; }
+    if findmnt -n --mountpoint "${target}" >/dev/null 2>&1; then
+        log_event "move refused: ${target} is already a separate mount"
+        return 1
+    fi
+    fs="$(blkid -s TYPE -o value "${dev}")"
+    tmp="/run/sv-storage-move/${role}"
+    mkdir -p "${tmp}"
+    mount "${dev}" "${tmp}" || { log_event "move refused: could not mount ${uuid}"; return 1; }
+    if [[ -n "$(find "${tmp}" -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit)" ]]; then
+        umount "${tmp}"
+        log_event "move refused: the new drive ${uuid} is not empty"
+        return 1
+    fi
+    if [[ -d "${target}" ]]; then
+        plymouth_say "Moving $(role_words "${role}") to the new drive. This can take a while; please wait."
+        if ! rsync -aHAX --numeric-ids "${target}/" "${tmp}/" >> "${LOG_FILE}" 2>&1; then
+            umount "${tmp}"
+            log_event "move refused: copying ${target} failed; the original is unchanged"
+            return 1
+        fi
+        src_sum="$(tree_summary "${target}")"
+        dst_sum="$(tree_summary "${tmp}")"
+        if [[ "${src_sum}" != "${dst_sum}" ]]; then
+            umount "${tmp}"
+            log_event "move refused: copy check failed (original ${src_sum}, copy ${dst_sum}); the original is unchanged"
+            return 1
+        fi
+        log_event "move copied and checked: ${src_sum} (entries bytes)"
+    fi
+    umount "${tmp}"
+    rmdir "${tmp}" 2>/dev/null || true
+
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    old="${OLD_DIR}/${role}-${stamp}"
+    mkdir -p "${OLD_DIR}"
+    chmod 700 "${OLD_DIR}"
+    backup="${FSTAB}.sv-storage-${stamp}-move"
+    cp -a "${FSTAB}" "${backup}"
+    if [[ -d "${target}" ]]; then
+        mv "${target}" "${old}"
+        mkdir "${target}"
+        chmod --reference="${old}" "${target}"
+        chown --reference="${old}" "${target}"
+    else
+        mkdir -p "${target}"
+    fi
+    if ! fstab_add "${uuid}" "${target}" "${fs}" "$(mount_options "${fs}" "${role}" "" 0 0)" "${role}" "$(role_words "${role}")" \
+        || ! mount "${target}"; then
+        log_event "move failed: could not mount ${target}; putting the original back"
+        umount "${target}" 2>/dev/null || true
+        if [[ -d "${old}" ]]; then
+            rmdir "${target}" && mv "${old}" "${target}"
+        fi
+        cp -a "${backup}" "${FSTAB}"
+        systemctl daemon-reload
+        return 1
+    fi
+    restorecon -R "${target}" || log_event "restorecon reported problems on ${target}"
+    log_event "move done: ${target} is on ${uuid}; old copy in ${old}"
+}
+
+# cmd_run_moves
+#   Runs the moves queued by `sv-storage setup`. Started at boot by
+#   shatteredvales-storage-move.service, before the login screen and
+#   container services, so nothing uses the folders while they move.
+#   Arguments: none
+#   Returns: 0 when every move succeeded, 1 otherwise
+cmd_run_moves() {
+    local role uuid target failed=0
+    (( EUID == 0 )) || die "run-moves runs at start-up as root"
+    [[ -s "${MOVES_FILE}" ]] || return 0
+    while read -r role uuid target; do
+        [[ -n "${role}" ]] || continue
+        if ! process_move "${role}" "${uuid}" "${target}"; then
+            printf '%s %s %s %s\n' "${role}" "${uuid}" "${target}" "$(date -Is)" >> "${MOVES_FAILED}"
+            failed=1
+        fi
+    done < "${MOVES_FILE}"
+    # Failed moves are not retried at every start; they are recorded in
+    # the .failed file, shown by `sv-storage list` and sv-doctor, and the
+    # drive can simply be set up again.
+    rm -f "${MOVES_FILE}"
+    plymouth_say ""
+    return "${failed}"
+}
+
+# ---------------------------------------------------------------- cleanup
+
+# cmd_cleanup
+#   Deletes the old copies of moved folders after confirmation.
+#   Arguments: none
+#   Returns: 0 on success; exits 3 when cancelled
+cmd_cleanup() {
+    local entry reply
+    if [[ ! -d "${OLD_DIR}" ]] || [[ -z "$(ls -A "${OLD_DIR}" 2>/dev/null)" ]]; then
+        say "Nothing to clean up"
+        echo "There are no old copies from earlier moves."
+        return 0
+    fi
+    if (( EUID != 0 && ! DRY_RUN )); then
+        run_as_admin cleanup "$( ((ASSUME_YES)) && echo --yes || echo --interactive)"
+        return
+    fi
+    say "Old copies kept on the system drive"
+    for entry in "${OLD_DIR}"/*; do
+        printf '  %-40s %s\n' "$(basename "${entry}")" "$(du -sh "${entry}" 2>/dev/null | cut -f1)"
+    done
+    echo
+    echo "These are the folders as they were before they moved to their new drive."
+    echo "Only delete them once you have checked that everything works."
+    if (( ! ASSUME_YES && ! DRY_RUN )); then
+        reply="$(ask "Type delete to remove them, anything else to keep them: " "")"
+        [[ "${reply,,}" == delete ]] || { echo "Kept. Nothing was changed."; exit 3; }
+    fi
+    for entry in "${OLD_DIR}"/*; do
+        run rm -rf --one-file-system "${entry}"
+    done
+    (( DRY_RUN )) || echo "Done. The space is free again."
+}
+
+# ---------------------------------------------------------------- remove
+
+# storage_entries
+#   Lists the storage drives sv-storage set up.
+#   Arguments: none
+#   Output: "<uuid>\t<mount point>\t<name>" per entry
+#   Returns: 0 always
+storage_entries() {
+    [[ -r "${FSTAB}" ]] || return 0
+    awk -v mark="${FSTAB_MARK}" '
+        index($0, mark) == 1 { split(substr($0, length(mark) + 2), a, " "); role = a[1];
+                               name = substr($0, length(mark) + 2 + length(role) + 1); next }
+        role == "storage" && $1 ~ /^UUID=/ { print substr($1, 6) "\t" $2 "\t" name }
+        { role = "" }
+    ' "${FSTAB}" | while IFS=$'\t' read -r uuid mp name; do
+        printf '%s\t%s\t%s\n' "${uuid}" "$(fstab_unescape "${mp}")" "${name}"
+    done
+}
+
+# cmd_remove
+#   Stops using a storage drive: unmounts it and removes its fstab entry.
+#   Nothing on the drive is erased.
+#   Arguments: optional name, mount point or device, --yes, --dry-run
+#   Returns: 0 on success; exits non-zero on failure or cancel
+cmd_remove() {
+    local which="" uuid mp name entry dev_uuids
+    while (( $# )); do
+        case "$1" in
+            -*) die "unknown option $1" 64 ;;
+            *) which="$1" ;;
+        esac
+        shift
+    done
+    require_changes_allowed
+    local -a entries
+    mapfile -t entries < <(storage_entries)
+    (( ${#entries[@]} )) || { say "No storage drives are set up"; return 0; }
+    if [[ -z "${which}" ]]; then
+        (( ASSUME_YES )) && die "--yes needs a name or drive" 64
+        local -a menu=()
+        for entry in "${entries[@]}"; do
+            IFS=$'\t' read -r uuid mp name <<<"${entry}"
+            menu+=("${uuid}|${name} at ${mp}")
+        done
+        which="$(choose "Which storage drive should no longer be used?" "" "${menu[@]}")"
+    fi
+    if [[ "${which}" == /dev/* || -b "/dev/${which}" ]]; then
+        load_drives
+        local d
+        d="$(resolve_device "${which}")" || die "there is no drive called ${which}"
+        dev_uuids="$(drive_get "${d}" '.uuids[]')"
+    fi
+    local found=""
+    for entry in "${entries[@]}"; do
+        IFS=$'\t' read -r uuid mp name <<<"${entry}"
+        if [[ "${which}" == "${uuid}" || "${which}" == "${name}" || "${which}" == "${mp}" ]] \
+            || grep -qxF "${uuid}" <<<"${dev_uuids:-}"; then
+            found="${entry}"
+            break
+        fi
+    done
+    [[ -n "${found}" ]] || die "no storage drive called ${which} (see: sv-storage list)"
+    IFS=$'\t' read -r uuid mp name <<<"${found}"
+    if (( ! CONFIRMED )); then
+        say "Stop using \"${name}\""
+        echo "  The folder ${mp} goes away and the drive is no longer opened at start-up."
+        echo "  Nothing on the drive is erased; set it up again any time to keep using it."
+        confirm_plain "Continue?"
+    fi
+    if (( EUID != 0 && ! DRY_RUN )); then
+        run_as_admin remove "${uuid}" --confirmed
+        return
+    fi
+    if findmnt -n --mountpoint "${mp}" >/dev/null 2>&1; then
+        run umount "${mp}" || die "the drive is busy; close any files or windows using ${mp} and try again"
+    fi
+    fstab_remove_uuid "${uuid}"
+    if [[ -d "${mp}" ]] && [[ -z "$(ls -A "${mp}")" ]]; then
+        run rmdir "${mp}"
+    fi
+    log_event "removed storage ${name} (${uuid}) from ${mp}"
+    (( DRY_RUN )) || echo "Done. The drive is no longer used by this computer."
+}
+
+# ---------------------------------------------------------------- usb
+
+# usb_candidates
+#   Lists drives that may be formatted as USB drives: portable and not part
+#   of the system or set up as a permanent drive.
+#   Arguments: none
+#   Output: one drive path per line
+#   Returns: 0 always
+usb_candidates() {
+    local dev
+    while read -r dev; do
+        [[ -n "${dev}" ]] || continue
+        usb_refusal "${dev}" >/dev/null && echo "${dev}"
+    done < <(drive_paths)
+    return 0
+}
+
+# usb_refusal
+#   Explains why a drive cannot be formatted as a USB drive.
+#   Arguments: $1 drive path
+#   Output: the reason on stdout, when there is one
+#   Returns: 0 when it may be formatted, 1 otherwise
+usb_refusal() {
+    local dev="$1" c
+    c="$(classify "${dev}")"
+    case "${c%%|*}" in
+        system) echo "it holds the system (Shattered Vales OS itself)"; return 1 ;;
+        moving|role|configured) echo "it is set up as a permanent drive: ${c#*|} (see: sv-storage remove)"; return 1 ;;
+        member) echo "it belongs to an encrypted, RAID or LVM set"; return 1 ;;
+    esac
+    if ! is_portable "${dev}"; then
+        echo "it is not a USB or removable drive (internal drives are set up with: sv-storage setup)"
+        return 1
+    fi
+    if [[ "$(drive_get "${dev}" .ro)" == true ]]; then
+        echo "it is read-only (check the lock switch on SD cards)"
+        return 1
+    fi
+    # Anything mounted outside /run/media was mounted on purpose by someone,
+    # not by the desktop when the stick was plugged in.
+    if grep -v '^/run/media/' <<<"$(drive_get "${dev}" '.mounts[]')" | grep . >/dev/null; then
+        echo "it is in use outside the desktop's USB mounts"
+        return 1
+    fi
+    return 0
+}
+
+# apply_usb
+#   Formats a USB drive that has been confirmed. Image writers such as
+#   balenaEtcher leave an ISO9660 filesystem at the start of the stick and
+#   a backup GPT at its end, which survive a plain new partition table and
+#   confuse every tool, so both ends are zeroed as well as wiped.
+#   Arguments: $1 drive, $2 filesystem (exfat, fat32, ntfs, ext4),
+#              $3 label, $4 user who will own an ext4 drive
+#   Returns: 0 on success, 1 on failure
+apply_usb() {
+    local dev="$1" fs="$2" label="$3" owner="$4" part reason size sectors type tmp
+    if (( EUID != 0 && ! DRY_RUN )); then
+        die "this step must run as an administrator"
+    fi
+    if reason="$(usb_refusal "${dev}")"; then :; else
+        die "${dev#/dev/} cannot be formatted: ${reason}"
+    fi
+    log_event "usb format ${dev} fs=${fs} label=${label} owner=${owner:-root}"
+    say "Unmounting"
+    while read -r part; do
+        [[ -n "${part}" ]] || continue
+        run udisksctl unmount --no-user-interaction -b "${part}" \
+            || die "could not unmount ${part}; close any windows using the stick and try again"
+    done < <(drive_get "${dev}" '.parts[] | select(.mounts | length > 0) | .path')
+    # Image writers can leave a filesystem on the whole stick, mounted
+    # without any partition.
+    if [[ -n "$(drive_get "${dev}" '.mounts[]')" ]] && (( ! DRY_RUN )) \
+        && [[ -n "$(lsblk -ndo MOUNTPOINTS "${dev}" | tr -d '[:space:]')" ]]; then
+        run udisksctl unmount --no-user-interaction -b "${dev}" \
+            || die "could not unmount ${dev}; close any windows using the stick and try again"
+    fi
+    if (( ! DRY_RUN )) && [[ -n "$(lsblk -nro MOUNTPOINTS "${dev}" | tr -d '[:space:]')" ]]; then
+        die "${dev} is still in use; nothing was erased"
+    fi
+
+    say "Erasing"
+    wipe_drive "${dev}"
+    size="$(drive_get "${dev}" .size)"
+    sectors=$(( size / 512 ))
+    run dd if=/dev/zero of="${dev}" bs=512 count=4096 conv=fsync status=none
+    if (( sectors > 8192 )); then
+        run dd if=/dev/zero of="${dev}" bs=512 seek=$(( sectors - 4096 )) count=4096 conv=fsync status=none
+    fi
+    run blockdev --rereadpt "${dev}" || true
+    run udevadm settle
+
+    case "${fs}" in
+        exfat|ntfs) type=7 ;;
+        fat32)      type=c ;;
+        ext4)       type=83 ;;
+    esac
+    if (( DRY_RUN )); then
+        printf '  would run: sfdisk %s, with the table "label: dos; type=%s"\n' "${dev}" "${type}"
+    else
+        log_event "run: sfdisk dos type=${type} ${dev}"
+        # MBR rather than GPT: older TVs, cameras, car stereos and some
+        # Windows versions only read MBR sticks.
+        printf 'label: dos\ntype=%s\n' "${type}" | sfdisk --quiet --wipe always --wipe-partitions always "${dev}"
+    fi
+    part="$(wait_for_partition "${dev}")" || die "the new partition on ${dev} did not appear"
+    say "Formatting as ${fs}"
+    make_filesystem "${part}" "${fs}" "${label}"
+    if [[ "${fs}" == ext4 && -n "${owner}" ]]; then
+        # ext4 keeps Linux owners: without this only root could write to it.
+        if (( DRY_RUN )); then
+            echo "  would mount ${part} briefly and give its top folder to ${owner}"
+        else
+            tmp="$(mktemp -d /run/sv-storage-usb.XXXXXX)"
+            mount "${part}" "${tmp}"
+            chown "${owner}:$(id -gn "${owner}")" "${tmp}"
+            umount "${tmp}"
+            rmdir "${tmp}"
+        fi
+    fi
+    run udevadm settle
+    log_event "usb format done: ${dev} ${fs} ${label}"
+    (( DRY_RUN )) || echo "${part}" > "/run/sv-storage-usb-${owner:-root}.last" 2>/dev/null || true
+}
+
+# cmd_usb
+#   Asks which USB drive to format and how, then formats it and opens it
+#   in Files.
+#   Arguments: usb options (see Usage)
+#   Returns: 0 on success; exits non-zero on failure or cancel
+cmd_usb() {
+    local dev="" fs="" name="" owner="" mount=1 reason part
+    while (( $# )); do
+        case "$1" in
+            --fs) fs="${2:?}"; shift ;;
+            --name) name="${2:?}"; shift ;;
+            --owner) owner="${2:?}"; shift ;;
+            --no-mount) mount=0 ;;
+            -*) die "unknown option $1" 64 ;;
+            *) dev="$1" ;;
+        esac
+        shift
+    done
+    require_changes_allowed
+    load_drives
+    if [[ -z "${dev}" ]]; then
+        (( ASSUME_YES )) && die "--yes needs a drive" 64
+        local -a candidates
+        mapfile -t candidates < <(usb_candidates)
+        if (( ${#candidates[@]} == 0 )); then
+            say "No USB drive found"
+            echo "Plug in the USB stick or card you want to format, then try again."
+            return 0
+        fi
+        dev="$(pick_drive "Which USB drive do you want to format?" "${candidates[@]}")"
+    else
+        dev="$(resolve_device "${dev}")" || die "there is no drive called ${dev}"
+    fi
+    if reason="$(usb_refusal "${dev}")"; then :; else
+        die "${dev#/dev/} cannot be formatted: ${reason}"
+    fi
+    if [[ -z "${fs}" ]]; then
+        (( ASSUME_YES )) && die "--yes needs --fs" 64
+        fs="$(choose "How will you use it?" exfat \
+            "exfat|exFAT: works on Windows, Mac, Linux, TVs and cameras; large files are fine" \
+            "fat32|FAT32: for very old devices and car stereos; no single file over 4 GB" \
+            "ntfs|NTFS: for Windows computers" \
+            "ext4|ext4: Linux only")"
+    fi
+    [[ "${fs}" =~ ^(exfat|fat32|ntfs|ext4)$ ]] || die "unknown filesystem ${fs}" 64
+    [[ "${fs}" == fat32 ]] && warn "FAT32 cannot hold any single file larger than 4 GB."
+    if [[ -z "${name}" ]]; then
+        (( ASSUME_YES )) && die "--yes needs --name" 64
+        name="$(ask_name "${fs}" USB)"
+    fi
+    name="$(validate_name "${fs}" "${name}")" || exit 64
+    confirm_erase "${dev}" "one ${fs} partition called \"${name}\" (MBR table, for the widest compatibility)"
+
+    [[ -n "${owner}" ]] || owner="$(invoking_user)"
+    if (( DRY_RUN )); then
+        say "Dry run: these are the steps; nothing is changed"
+        apply_usb "${dev}" "${fs}" "${name}" "${owner}"
+        return 0
+    fi
+    if (( EUID != 0 )); then
+        run_as_admin usb "${dev}" --fs "${fs}" --name "${name}" --owner "${owner}" --no-mount --confirmed || return
+        # Mounted by the person rather than root, so it opens under their
+        # name in Files like any stick they plug in.
+        part="$(lsblk -nlpo PATH,TYPE "${dev}" | awk '$2 == "part" {print $1; exit}')"
+        if (( mount )) && [[ -n "${part}" ]]; then
+            udisksctl mount --no-user-interaction -b "${part}" || echo "Unplug the stick and plug it back in to open it."
+        fi
+    else
+        apply_usb "${dev}" "${fs}" "${name}" "${owner}"
+        part="$(lsblk -nlpo PATH,TYPE "${dev}" | awk '$2 == "part" {print $1; exit}')"
+        if (( mount )) && [[ -n "${owner}" && -n "${part}" ]]; then
+            runuser -u "${owner}" -- udisksctl mount --no-user-interaction -b "${part}" 2>/dev/null \
+                || echo "Unplug the stick and plug it back in to open it."
+        fi
+    fi
+    # The elevated copy stays quiet here; the person's own copy reports.
+    (( CONFIRMED )) && return 0
+    say "Done"
+    echo "The USB drive \"${name}\" is ready."
+}
+
+# ---------------------------------------------------------------- main
+
+# usage
+#   Prints the usage section of this file's header.
+#   Arguments: none
+#   Returns: 0 always
+usage() {
+    sed -n '/^# Usage:/,/^#$/p' "${SELF}" | sed 's/^# \{0,3\}//'
+}
+
+# main
+#   Parses the common options and runs the subcommand.
+#   Arguments: subcommand and options (see Usage)
+#   Returns: the subcommand's status
+main() {
+    local cmd=list status=0
+    local -a rest=()
+    if (( $# )) && [[ "$1" != -* ]]; then
+        cmd="$1"
+        shift
+    fi
+    while (( $# )); do
+        case "$1" in
+            --dry-run) DRY_RUN=1 ;;
+            --yes|-y) ASSUME_YES=1 ;;
+            --wait) WAIT=1 ;;
+            --confirmed) CONFIRMED=1; ASSUME_YES=1 ;;
+            --interactive) ;;
+            -h|--help) usage; return 0 ;;
+            *) rest+=("$1") ;;
+        esac
+        shift
+    done
+    set -- "${rest[@]+"${rest[@]}"}"
+    case "${cmd}" in
+        list)      cmd_list || status=$? ;;
+        check)     cmd_check || status=$? ;;
+        setup)     ( cmd_setup "$@" ) || status=$? ;;
+        usb)       ( cmd_usb "$@" ) || status=$? ;;
+        remove)    ( cmd_remove "$@" ) || status=$? ;;
+        cleanup)   ( cmd_cleanup ) || status=$? ;;
+        run-moves) cmd_run_moves || status=$? ;;
+        help)      usage ;;
+        *)         usage >&2; return 64 ;;
+    esac
+    if (( WAIT )); then
+        read -r -p $'\nPress Enter to close.' _ </dev/tty || true
+    fi
+    return "${status}"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
