@@ -21,6 +21,9 @@
 #
 # Usage:
 #   Runs automatically at login. Can be re-run manually with `sv-first-login`.
+#   `first-login.sh --list-steps` prints the id of every registered step,
+#   Core's and the editions', one per line, without running anything (used
+#   by sv-doctor).
 #
 # State:
 #   ~/.local/state/shatteredvales/<step>.done marks a finished step.
@@ -344,20 +347,37 @@ load_dropins() {
     done
 }
 
-# main
-#   Runs every login hook and pending setup step, logging to the state
-#   directory.
+# register_steps
+#   Registers Core's hooks and steps, then loads the editions' drop-ins,
+#   which add theirs.
 #   Arguments: none
-#   Returns: 0 always; failed steps are retried at the next login
-main() {
-    mkdir -p "${STATE_DIR}"
-    exec >>"${LOG_FILE}" 2>&1
-
+#   Returns: 0 always
+register_steps() {
     STEPS=("terminal-palette-v1 step_terminal_palette")
     # Last, because the installs download several hundred MB.
     LATE_STEPS=("artcraft-apps-v1 step_artcraft_apps")
     LOGIN_HOOKS=(notify_new_drives)
     load_dropins
+}
+
+# main
+#   Runs every login hook and pending setup step, logging to the state
+#   directory, or lists the registered steps with --list-steps.
+#   Arguments: $1 optional --list-steps
+#   Returns: 0 always; failed steps are retried at the next login
+main() {
+    if [[ "${1:-}" == --list-steps ]]; then
+        register_steps >/dev/null 2>&1
+        local entry
+        for entry in "${STEPS[@]}" "${LATE_STEPS[@]}"; do
+            echo "${entry%% *}"
+        done
+        return 0
+    fi
+
+    mkdir -p "${STATE_DIR}"
+    exec >>"${LOG_FILE}" 2>&1
+    register_steps
 
     local failed=0 hook
     for hook in "${LOGIN_HOOKS[@]}"; do

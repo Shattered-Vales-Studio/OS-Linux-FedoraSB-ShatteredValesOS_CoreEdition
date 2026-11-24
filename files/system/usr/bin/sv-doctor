@@ -70,7 +70,7 @@ deployment_field() {
 #   Arguments: none
 #   Returns: 0 always
 check_image() {
-    local ref staged built age
+    local ref image staged built age
     ref="$(deployment_field booted container-image-reference)"
     if [[ -z "${ref}" ]]; then
         report FAIL "OS image" "Not running from a container image (rpm-ostree status failed)"
@@ -79,7 +79,13 @@ check_image() {
     report INFO "OS image" "${ref#*docker://} ($(deployment_field booted version))"
     case "${ref}" in
         ostree-image-signed:*) report PASS "Signature" "Updates are signature-verified" ;;
-        *) report WARN "Signature" "Unverified image; rebase to ostree-image-signed:docker://${ref#*docker://} (see README)" ;;
+        *)
+            # The reference carries a transport prefix (for example
+            # ostree-unverified-registry: or ostree-remote-image:...:docker://)
+            # that the suggested command must not repeat.
+            image="${ref#*docker://}"
+            image="${image#ostree-unverified-registry:}"
+            report WARN "Signature" "Unverified image; run: sudo bootc switch --enforce-container-sigpolicy ${image}" ;;
     esac
 
     staged="$(deployment_field staged checksum)"
@@ -209,13 +215,18 @@ check_flatpaks() {
 }
 
 # check_first_login
-#   Compares completed per-user setup steps with those first-login.sh runs.
+#   Compares completed per-user setup steps with every step first-login.sh
+#   registers, including the edition's drop-in steps.
 #   Arguments: none
 #   Returns: 0 always
 check_first_login() {
     local -a steps pending=()
     local step
-    mapfile -t steps < <(grep -oE 'run_step [a-z0-9-]+' "${FIRST_LOGIN}" | awk '{print $2}')
+    mapfile -t steps < <("${FIRST_LOGIN}" --list-steps)
+    if (( ${#steps[@]} == 0 )); then
+        report WARN "User setup" "Could not list the first-login steps (${FIRST_LOGIN} --list-steps)"
+        return
+    fi
     for step in "${steps[@]}"; do
         [[ -f "${STATE_DIR}/${step}.done" ]] || pending+=("${step}")
     done
