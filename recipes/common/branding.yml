@@ -1,0 +1,8 @@
+---
+# Applies brand colors, fonts and artwork to boot, login, lock and desktop.
+# The scripts ship in the image, so every edition built on Core runs the
+# same ones again after copying in its own brand.env, artwork and settings.
+modules:
+  - type: script
+    snippets:
+      - /usr/libexec/shatteredvales/build/apply-branding.sh

@@ -1,0 +1,28 @@
+{
+  "policies": {
+    "ManagedBookmarks": [
+      {
+        "toplevel_name": "Shattered Vales"
+      },
+      {
+        "name": "Shattered Vales Studio",
+        "url": "https://shatteredvales.studio/"
+      },
+      {
+        "name": "Guides",
+        "url": "https://shatteredvales.studio/guide/"
+      }
+    ],
+    "DisplayBookmarksToolbar": "always",
+    "EncryptedMediaExtensions": {
+      "Enabled": true,
+      "Locked": false
+    },
+    "DontCheckDefaultBrowser": true,
+    "Homepage": {
+      "URL": "https://shatteredvales.studio/",
+      "StartPage": "homepage",
+      "Locked": false
+    }
+  }
+}

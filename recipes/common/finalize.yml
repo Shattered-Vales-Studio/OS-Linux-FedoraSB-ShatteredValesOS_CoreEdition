@@ -1,0 +1,9 @@
+---
+# Signing must stay last among content-changing modules so the published
+# signature policy matches what machines verify against. The release gate
+# ships in the image, so editions run the same one with their own lists.
+modules:
+  - type: signing
+  - type: script
+    snippets:
+      - /usr/libexec/shatteredvales/build/verify-image.sh

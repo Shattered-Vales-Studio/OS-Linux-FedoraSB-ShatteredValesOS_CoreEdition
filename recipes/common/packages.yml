@@ -1,0 +1,34 @@
+---
+# System-level software layered into the image. Anything here updates with
+# the image itself, so it must not be a tool that self-updates in place.
+modules:
+  - type: dnf
+    repos:
+      files:
+        - https://pkgs.tailscale.com/stable/fedora/tailscale.repo
+    install:
+      packages:
+        # Remote access and help. Installed but never signed in: whoever
+        # looks after a machine signs it in to their own tailnet.
+        # tailscaled runs but does nothing until then.
+        - tailscale
+        # Mail and calendar. Layered rather than a Flatpak so it is present
+        # offline from the very first boot and covered by the release gate.
+        - thunderbird
+        # Desktop layout: native Fedora packages track the shipped GNOME
+        # version, so they break far less often than extensions.gnome.org builds
+        - gnome-shell-extension-dash-to-dock
+        - gnome-shell-extension-appindicator
+        # Python GObject bindings: first-login.sh reads account pictures
+        # with GdkPixbuf, and editions ship small GTK 4 / libadwaita tools.
+        # Both are in the Silverblue base today and listed so a base change
+        # cannot drop them.
+        - python3-gobject
+        - libadwaita
+        # Used by sv-gpu-image, sv-update and the first-login script
+        - jq
+        # `fastfetch` system summary with the Shattered Vales logo
+        - fastfetch
+        - pciutils
+        - libnotify
+

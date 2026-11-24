@@ -1,0 +1,104 @@
+# Core Edition release gate. Every edition built on Core keeps this list,
+# so anything here is checked in every edition's build too. Rule format is
+# described in /usr/libexec/shatteredvales/build/verify-image.sh.
+
+# Packages Core layers or depends on.
+rpm tailscale
+rpm firefox
+rpm thunderbird
+rpm nano
+rpm python3-gobject
+rpm libadwaita
+rpm openssl
+rpm gnome-shell-extension-dash-to-dock
+rpm gnome-shell-extension-appindicator
+rpm jq
+rpm pciutils
+rpm libnotify
+rpm fastfetch
+# Full video playback comes from the base image's negativo17 FFmpeg and
+# Mesa builds; gated so a base-image change cannot silently drop H.264/HEVC
+# in Firefox or hardware decoding.
+rpm libavcodec
+rpm libva-intel-media-driver
+path /usr/lib64/dri/radeonsi_drv_video.so
+
+# Build tools every edition runs again over Core.
+path /usr/libexec/shatteredvales/build/apply-branding.sh
+path /usr/libexec/shatteredvales/build/set-os-release.sh
+path /usr/libexec/shatteredvales/build/write-banners.sh
+path /usr/libexec/shatteredvales/build/patch-shell-theme.sh
+path /usr/libexec/shatteredvales/build/dconf-update.sh
+path /usr/libexec/shatteredvales/build/build-plymouth.sh
+path /usr/libexec/shatteredvales/build/verify-image.sh
+path /usr/share/shatteredvales/theme/gnome-shell-theme.orig.gresource
+
+# Terminal colours, system summary logo and sign-in banners.
+path /usr/share/shatteredvales/ptyxis/ShatteredVales.palette
+path /usr/share/shatteredvales/fastfetch/logo.txt
+path /etc/xdg/fastfetch/config.jsonc
+path /etc/issue.d/50-shatteredvales.issue
+path /usr/lib/motd.d/50-shatteredvales
+
+# Wallpapers offered in Settings > Appearance.
+path /usr/share/backgrounds/shatteredvales/space.jpg
+path /usr/share/backgrounds/shatteredvales/earth.jpg
+path /usr/share/backgrounds/shatteredvales/vale.jpg
+path /usr/share/backgrounds/shatteredvales/circuit.jpg
+path /usr/share/gnome-background-properties/shatteredvales.xml
+
+# ArtCraft: the launcher and the apps installed at first login.
+path /usr/bin/artcraft-launcher
+path /usr/share/shatteredvales/artcraft-apps.list
+
+# Boot menu theme.
+path /usr/share/shatteredvales/grub-theme/theme.txt
+path /usr/share/shatteredvales/grub-theme/theme.cfg
+path /usr/share/shatteredvales/grub-theme/logo.png
+path /usr/share/shatteredvales/grub-theme/lato-regular-28.pf2
+path /usr/libexec/shatteredvales/grub-theme.sh
+path /usr/lib/systemd/system/shatteredvales-grub-theme.service
+
+# Network: Windows discovery in the firewall and pinned shares.
+path /etc/firewalld/zones/FedoraWorkstation.xml
+path /etc/shatteredvales/network-shares
+
+# Brand fonts.
+path /usr/share/fonts/google-fonts/Cinzel
+path /usr/share/fonts/google-fonts/Lato
+path /usr/share/fonts/google-fonts/JetBrains Mono
+
+# Support, update and per-person setup tools.
+path /usr/bin/sv-doctor
+path /usr/bin/sv-update
+path /usr/bin/sv-gpu-image
+path /usr/bin/sv-first-login
+path /usr/libexec/shatteredvales/first-login.sh
+path /etc/xdg/autostart/shatteredvales-first-login.desktop
+path /usr/libexec/shatteredvales/update-reminder.sh
+path /usr/lib/systemd/user/shatteredvales-update-reminder.timer
+path /usr/libexec/shatteredvales/signed-switch.sh
+path /usr/lib/systemd/system/shatteredvales-signed-switch.service
+path /usr/share/applications/shatteredvales-update.desktop
+path /usr/share/icons/hicolor/scalable/apps/shatteredvales-update.svg
+
+# Default apps and browser policy.
+path /etc/xdg/mimeapps.list
+path /etc/firefox/policies/policies.json
+
+# Desktop files referenced by favorite-apps in the dconf defaults.
+path /usr/share/applications/org.mozilla.firefox.desktop
+path /usr/share/applications/org.gnome.Nautilus.desktop
+path /usr/share/applications/net.thunderbird.Thunderbird.desktop
+path /usr/share/applications/org.gnome.Settings.desktop
+
+# Branding.
+path /usr/share/plymouth/themes/shatteredvales/watermark.png
+path /usr/share/backgrounds/shatteredvales/wallpaper.png
+path /usr/share/shatteredvales/lockscreen-header.png
+path /usr/share/shatteredvales/avatar.png
+path /usr/share/shatteredvales/avatar-admin.png
+path /usr/share/pixmaps/shatteredvales-gdm-logo.png
+path /usr/share/shatteredvales/brand.env
+path /etc/dconf/db/local
+path /etc/dconf/db/gdm
