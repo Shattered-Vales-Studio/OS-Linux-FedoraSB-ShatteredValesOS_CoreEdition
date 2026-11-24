@@ -26,7 +26,12 @@
 #   scripts/render-branding.sh [target-repo]
 #   With no argument the target is this repository (`just branding`).
 #   Editions run it from a Core Edition checkout with their own repository
-#   as the target.
+#   as the target. An edition receives only the artwork that names the
+#   edition (lock screen, boot splash, login, Settings > About and boot-menu
+#   logos, its own launcher icons) and its brand.env copy; everything that
+#   looks the same in every edition (wallpapers, account pictures, logo
+#   icons, boot-menu frame and fonts, terminal logo) comes from Core's
+#   image, so improvements to it reach every edition.
 #
 # Requirements:
 #   docker (OrbStack works) or podman on the host.
@@ -51,6 +56,39 @@ container_cli() {
     fi
 }
 
+# publish_render
+#   Copies rendered artwork into the target repository: everything when Core
+#   renders itself, and only the edition-specific files for an edition
+#   (EDITION_ONLY=1), so an edition never carries stale copies of artwork
+#   Core provides.
+#   Arguments: $1 staging folder, $2 the target's files/system folder
+#   Returns: 0 on success
+publish_render() {
+    local stage="$1" dest="$2" path glyph
+    if [[ "${EDITION_ONLY:-0}" != 1 ]]; then
+        cp -a "${stage}/." "${dest}/"
+        return 0
+    fi
+    local -a paths=(
+        usr/share/shatteredvales/brand.env
+        usr/share/shatteredvales/lockscreen-header.png
+        usr/share/plymouth/themes/shatteredvales/watermark.png
+        usr/share/pixmaps/shatteredvales-gdm-logo.png
+        usr/share/pixmaps/fedora_logo_med.png
+        usr/share/pixmaps/fedora_whitelogo_med.png
+        usr/share/shatteredvales/grub-theme/logo.png
+        usr/share/shatteredvales/grub-theme/theme.txt
+    )
+    for glyph in branding/icons/*.glyph; do
+        [[ -f "${glyph}" ]] || continue
+        paths+=("usr/share/icons/hicolor/scalable/apps/$(basename "${glyph}" .glyph).svg")
+    done
+    for path in "${paths[@]}"; do
+        mkdir -p "${dest}/$(dirname "${path}")"
+        cp "${stage}/${path}" "${dest}/${path}"
+    done
+}
+
 # render_inside
 #   Body executed inside the container, with the Core Edition repository at
 #   /core and the target repository at /work (the same folder when Core
@@ -70,7 +108,8 @@ render_inside() {
     BRAND_FONT_BOLD_FILE="/core/${BRAND_FONT_BOLD_FILE}"
     BRAND_DISPLAY_FONT_FILE="/core/${BRAND_DISPLAY_FONT_FILE}"
 
-    local src=/core/branding/source out=files/system
+    local src=/core/branding/source dest=files/system out
+    out="$(mktemp -d)"
     local tmp; tmp="$(mktemp -d)"
     local -a stops
     read -r -a stops <<<"${BRAND_FOIL_STOPS}"
@@ -452,7 +491,9 @@ CFG
     # they live in their own generator rather than as ImageMagick steps.
     python3 /core/branding/wallpapers/generate.py --env branding/brand.env \
         --out "${out}/usr/share/backgrounds/shatteredvales"
-    echo "Branding rendered into ${out}"
+    publish_render "${out}" "${dest}"
+    rm -rf "${out}"
+    echo "Branding rendered into ${dest}"
 }
 
 # main
@@ -466,9 +507,12 @@ main() {
     [[ -f "${target}/branding/brand.env" ]] \
         || { echo "${target} has no branding/brand.env" >&2; return 1; }
     cli="$(container_cli)"
-    "${cli}" run --rm -v "${CORE}:/core:ro,Z" -v "${target}:/work:Z" \
+    local edition_only=0
+    [[ "${target}" == "${CORE}" ]] || edition_only=1
+    "${cli}" run --rm -e EDITION_ONLY="${edition_only}" \
+        -v "${CORE}:/core:ro,Z" -v "${target}:/work:Z" \
         registry.fedoraproject.org/fedora:latest \
-        bash -c "$(declare -f render_inside); render_inside"
+        bash -c "$(declare -f publish_render render_inside); render_inside"
 }
 
 main "$@"
