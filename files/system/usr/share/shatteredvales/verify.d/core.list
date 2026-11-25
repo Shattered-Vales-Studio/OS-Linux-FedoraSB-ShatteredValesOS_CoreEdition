@@ -79,6 +79,8 @@ path /usr/libexec/shatteredvales/update-reminder.sh
 path /usr/lib/systemd/user/shatteredvales-update-reminder.timer
 path /usr/libexec/shatteredvales/signed-switch.sh
 path /usr/lib/systemd/system/shatteredvales-signed-switch.service
+path /usr/libexec/shatteredvales/selinux-repair.sh
+path /usr/lib/systemd/system/shatteredvales-selinux-repair.service
 path /usr/share/applications/shatteredvales-update.desktop
 path /usr/share/icons/hicolor/scalable/apps/shatteredvales-update.svg
 

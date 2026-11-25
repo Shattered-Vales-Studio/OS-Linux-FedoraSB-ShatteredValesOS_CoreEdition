@@ -104,6 +104,11 @@ ghcr.io/blue-build/base-images/fedora-silverblue(-nvidia-open)
   setup goes in `first-login.sh` as a versioned step registered in `STEPS`
   or `LATE_STEPS`. Bump the suffix to force a step to run again for
   everyone. A step returns 2 when it cannot run yet (it is retried quietly).
+- SELinux must stay enforcing. `shatteredvales-selinux-repair.service`
+  turns it back on for machines whose installer booted them with
+  `selinux=0`; it edits kernel arguments only through `rpm-ostree kargs`
+  (which keeps a waiting update), never restarts the machine itself, and
+  leaves anyone who set `SELINUX=disabled` in `/etc/selinux/config` alone.
 - `verify-image.sh` is the release gate. When adding software, add a rule
   to `files/system/usr/share/shatteredvales/verify.d/core.list`.
 - GNOME Shell CSS selectors, extension settings and AccountsService's D-Bus
